@@ -1,0 +1,2 @@
+# Vendored from universal_ble (tool/vendor_universal_ble.sh): upstream's lint set.
+include: package:flutter_lints/flutter.yaml

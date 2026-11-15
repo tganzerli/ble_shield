@@ -1,0 +1,209 @@
+import 'dart:async';
+
+import 'package:flutter_test/flutter_test.dart';
+import 'package:ble_shield/src/native/native.dart';
+
+import 'ble_shield_native_test_mock.dart';
+
+class _CapturingPlatform extends BleShieldNativePlatformMock {
+  DiscoverServicesPlatformConfig? lastPlatformConfig;
+  bool? lastWithDescriptors;
+
+  @override
+  Future<List<BleService>> discoverServices(
+    String deviceId,
+    bool withDescriptors, {
+    DiscoverServicesPlatformConfig? platformConfig,
+  }) async {
+    lastWithDescriptors = withDescriptors;
+    lastPlatformConfig = platformConfig;
+    return const <BleService>[];
+  }
+}
+
+/// Answers each discovery after [delay], counting the discoveries it ran.
+class _SlowPlatform extends BleShieldNativePlatformMock {
+  _SlowPlatform(this.delay);
+
+  final Duration delay;
+  int discoveries = 0;
+
+  @override
+  Future<List<BleService>> discoverServices(
+    String deviceId,
+    bool withDescriptors, {
+    DiscoverServicesPlatformConfig? platformConfig,
+  }) async {
+    discoveries++;
+    await Future<void>.delayed(delay);
+    return const <BleService>[];
+  }
+}
+
+void main() {
+  const deviceId = 'AA:BB:CC:DD:EE:FF';
+
+  tearDown(() => BleShieldNative.timeout = const Duration(seconds: 10));
+
+  test('discoverServices forwards platformConfig to the platform', () async {
+    final platform = _CapturingPlatform();
+    BleShieldNative.setInstance(platform);
+    final config = DiscoverServicesPlatformConfig(
+      android: AndroidDiscoverServicesOptions(clearGattCache: true),
+    );
+    await BleShieldNative.discoverServices(deviceId, platformConfig: config);
+    expect(platform.lastPlatformConfig?.android, same(config.android));
+    expect(platform.lastPlatformConfig?.android?.clearGattCache, isTrue);
+    expect(platform.lastWithDescriptors, isFalse);
+  });
+
+  test('discoverServices without platformConfig passes only the global timeout',
+      () async {
+    final platform = _CapturingPlatform();
+    BleShieldNative.setInstance(platform);
+    await BleShieldNative.discoverServices(deviceId, withDescriptors: true);
+    expect(platform.lastPlatformConfig?.android, isNull);
+    expect(platform.lastPlatformConfig?.apple?.timeoutMillis, 10000);
+    expect(platform.lastWithDescriptors, isTrue);
+  });
+
+  test('a raised global timeout is passed to Apple', () async {
+    final platform = _CapturingPlatform();
+    BleShieldNative.setInstance(platform);
+    BleShieldNative.timeout = const Duration(seconds: 30);
+    await BleShieldNative.discoverServices(deviceId);
+    expect(platform.lastPlatformConfig?.apple?.timeoutMillis, 30000);
+  });
+
+  test('with no timeout at all, no platformConfig is passed', () async {
+    final platform = _CapturingPlatform();
+    BleShieldNative.setInstance(platform);
+    BleShieldNative.timeout = null;
+    await BleShieldNative.discoverServices(deviceId);
+    expect(platform.lastPlatformConfig, isNull);
+  });
+
+  test('a non-positive Apple timeout gives way to the timeout', () async {
+    final platform = _CapturingPlatform();
+    BleShieldNative.setInstance(platform);
+    await BleShieldNative.discoverServices(
+      deviceId,
+      timeout: const Duration(seconds: 30),
+      platformConfig: DiscoverServicesPlatformConfig(
+        apple: AppleDiscoverServicesOptions(timeoutMillis: 0),
+      ),
+    );
+    expect(platform.lastPlatformConfig?.apple?.timeoutMillis, 30000);
+  });
+
+  test(
+    'discoverServices passes its timeout to Apple as the native discovery timeout',
+    () async {
+      final platform = _CapturingPlatform();
+      BleShieldNative.setInstance(platform);
+      await BleShieldNative.discoverServices(
+        deviceId,
+        timeout: const Duration(seconds: 30),
+      );
+      expect(platform.lastPlatformConfig?.apple?.timeoutMillis, 30000);
+      expect(platform.lastPlatformConfig?.android, isNull);
+    },
+  );
+
+  test('the timeout keeps the Android options it was given', () async {
+    final platform = _CapturingPlatform();
+    BleShieldNative.setInstance(platform);
+    await BleShieldNative.discoverServices(
+      deviceId,
+      timeout: const Duration(seconds: 30),
+      platformConfig: DiscoverServicesPlatformConfig(
+        android: AndroidDiscoverServicesOptions(clearGattCache: true),
+      ),
+    );
+    expect(platform.lastPlatformConfig?.apple?.timeoutMillis, 30000);
+    expect(platform.lastPlatformConfig?.android?.clearGattCache, isTrue);
+  });
+
+  test('an Apple timeout set by the caller wins over the timeout', () async {
+    final platform = _CapturingPlatform();
+    BleShieldNative.setInstance(platform);
+    final config = DiscoverServicesPlatformConfig(
+      apple: AppleDiscoverServicesOptions(timeoutMillis: 45000),
+    );
+    await BleShieldNative.discoverServices(
+      deviceId,
+      timeout: const Duration(seconds: 30),
+      platformConfig: config,
+    );
+    expect(platform.lastPlatformConfig, same(config));
+    expect(platform.lastPlatformConfig?.apple?.timeoutMillis, 45000);
+  });
+
+  group('an Apple timeout given without a timeout', () {
+    // The command queue's default stands in for the 10 s it has in practice.
+    setUp(() => BleShieldNative.timeout = const Duration(milliseconds: 50));
+
+    test('bounds the whole call', () async {
+      BleShieldNative.setInstance(
+          _SlowPlatform(const Duration(milliseconds: 150)));
+      final services = await BleShieldNative.discoverServices(
+        deviceId,
+        platformConfig: DiscoverServicesPlatformConfig(
+          apple: AppleDiscoverServicesOptions(timeoutMillis: 1000),
+        ),
+      );
+      expect(services, isEmpty);
+    });
+
+    test('leaves the default when it is not positive', () async {
+      BleShieldNative.setInstance(
+          _SlowPlatform(const Duration(milliseconds: 150)));
+      await expectLater(
+        BleShieldNative.discoverServices(
+          deviceId,
+          platformConfig: DiscoverServicesPlatformConfig(
+            apple: AppleDiscoverServicesOptions(timeoutMillis: 0),
+          ),
+        ),
+        throwsA(isA<TimeoutException>()),
+      );
+    });
+  });
+
+  test('calls that differ only in their timeout share one discovery', () async {
+    final platform = _SlowPlatform(const Duration(milliseconds: 20));
+    BleShieldNative.setInstance(platform);
+    await Future.wait([
+      BleShieldNative.discoverServices(deviceId),
+      BleShieldNative.discoverServices(
+        deviceId,
+        timeout: const Duration(seconds: 30),
+      ),
+      BleShieldNative.discoverServices(
+        deviceId,
+        platformConfig: DiscoverServicesPlatformConfig(
+          apple: AppleDiscoverServicesOptions(timeoutMillis: 45000),
+        ),
+      ),
+    ]);
+    expect(platform.discoveries, 1);
+  });
+
+  test('calls with other Android options still run their own', () async {
+    final platform = _SlowPlatform(const Duration(milliseconds: 20));
+    BleShieldNative.setInstance(platform);
+    await Future.wait([
+      BleShieldNative.discoverServices(
+        deviceId,
+        timeout: const Duration(seconds: 30),
+      ),
+      BleShieldNative.discoverServices(
+        deviceId,
+        platformConfig: DiscoverServicesPlatformConfig(
+          android: AndroidDiscoverServicesOptions(clearGattCache: true),
+        ),
+      ),
+    ]);
+    expect(platform.discoveries, 2);
+  });
+}

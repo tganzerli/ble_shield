@@ -1,0 +1,488 @@
+//
+//  BleShieldNativeHelper.swift
+//  ble_shield
+//
+//  Created by Rohit Sangwan on 25/10/23.
+//
+
+import CoreBluetooth
+import Foundation
+#if os(iOS)
+    import Flutter
+#elseif os(OSX)
+    import FlutterMacOS
+#endif
+
+extension CBCharacteristicProperties {
+    var toCharacteristicProperty: [CharacteristicProperty] {
+        var properties = [CharacteristicProperty]()
+        if contains(.broadcast) {
+            properties.append(.broadcast)
+        }
+        if contains(.read) {
+            properties.append(.read)
+        }
+        if contains(.writeWithoutResponse) {
+            properties.append(.writeWithoutResponse)
+        }
+        if contains(.write) {
+            properties.append(.write)
+        }
+        if contains(.notify) {
+            properties.append(.notify)
+        }
+        if contains(.indicate) {
+            properties.append(.indicate)
+        }
+        if contains(.authenticatedSignedWrites) {
+            properties.append(.authenticatedSignedWrites)
+        }
+        if contains(.extendedProperties) {
+            properties.append(.extendedProperties)
+        }
+        return properties
+    }
+}
+
+extension CBManagerState {
+    func toAvailabilityState() -> AvailabilityState {
+        switch self {
+        case .unknown:
+            return .unknown
+        case .resetting:
+            return .resetting
+        case .unsupported:
+            return .unsupported
+        case .unauthorized:
+            return .unauthorized
+        case .poweredOff:
+            return .poweredOff
+        case .poweredOn:
+            return .poweredOn
+        @unknown default:
+            return .unknown
+        }
+    }
+}
+
+extension CBPeripheralState {
+    var toBleConnectionState: BleConnectionState {
+        switch self {
+        case .connecting:
+            return .connecting
+        case .connected:
+            return .connected
+        case .disconnecting:
+            return .disconnecting
+        case .disconnected:
+            return .disconnected
+        @unknown default:
+            return .disconnected
+        }
+    }
+}
+
+/// Maps string error codes to BleShieldNativeErrorCode enum
+func mapErrorCodeToEnum(_ code: String) -> BleShieldNativeErrorCode {
+    switch code.lowercased() {
+    case "notsupported", "not_supported":
+        return .notSupported
+    case "notimplemented", "not_implemented":
+        return .notImplemented
+    case "channel-error", "channelerror":
+        return .channelError
+    case "failed":
+        return .failed
+    case "devicedisconnected", "device_disconnected":
+        return .deviceDisconnected
+    case "illegalargument", "illegal_argument":
+        return .illegalArgument
+    case "invalidaction", "invalid_action":
+        return .invalidAction
+    case "readfailed", "read_failed":
+        return .readFailed
+    case "devicenotfound", "device_not_found":
+        return .deviceNotFound
+    case "servicenotfound", "service_not_found":
+        return .serviceNotFound
+    case "characteristicnotfound", "characteristic_not_found":
+        return .characteristicNotFound
+    case "invalidserviceuuid", "invalid_service_uuid":
+        return .invalidServiceUuid
+    case "characteristicdoesnotsupportread":
+        return .characteristicDoesNotSupportRead
+    case "characteristicdoesnotsupportwrite":
+        return .characteristicDoesNotSupportWrite
+    case "characteristicdoesnotsupportwritewithoutresponse":
+        return .characteristicDoesNotSupportWriteWithoutResponse
+    case "characteristicdoesnotsupportnotify":
+        return .characteristicDoesNotSupportNotify
+    case "characteristicdoesnotsupportindicate":
+        return .characteristicDoesNotSupportIndicate
+    default:
+        return .unknownError
+    }
+}
+
+/// Maps an ATT error code (`CBATTError.Code` in `CBATTErrorDomain`) to BleShieldNativeErrorCode,
+/// matching Android's `gattStatusToBleShieldNativeErrorCode` so a refusal reads the same everywhere.
+func attErrorToBleShieldNativeErrorCode(_ code: Int) -> BleShieldNativeErrorCode {
+    switch CBATTError.Code(rawValue: code) {
+    case .invalidHandle: return .invalidHandle
+    case .readNotPermitted: return .readNotPermitted
+    case .writeNotPermitted: return .writeNotPermitted
+    case .invalidPdu: return .invalidPdu
+    case .insufficientAuthentication: return .insufficientAuthentication
+    case .requestNotSupported: return .operationNotSupported
+    case .invalidOffset: return .invalidOffset
+    case .insufficientAuthorization: return .insufficientAuthorization
+    case .prepareQueueFull: return .operationInProgress
+    case .attributeNotFound: return .serviceNotFound
+    case .attributeNotLong: return .invalidAttributeLength
+    case .insufficientEncryptionKeySize: return .insufficientKeySize
+    case .invalidAttributeValueLength: return .invalidAttributeLength
+    case .unlikelyError: return .failed
+    case .insufficientEncryption: return .insufficientEncryption
+    case .unsupportedGroupType: return .operationNotSupported
+    case .insufficientResources: return .failed
+    default: return .unknownError
+    }
+}
+
+/// Creates a PigeonError carrying the error code enum's raw value
+func createFlutterError(
+    code: BleShieldNativeErrorCode,
+    message: String? = nil,
+    details: String? = nil
+) -> PigeonError {
+    // `code` and `details` are both numeric strings: the enum's raw value, unless
+    // the caller passes a native code (e.g. the ATT error) in details.
+    return PigeonError(
+        code: code.rawValue.description,
+        message: message,
+        details: details ?? code.rawValue
+    )
+}
+
+extension Error {
+    func toFlutterError() -> PigeonError {
+        if let pigeonError = self as? PigeonError {
+            return pigeonError
+        }
+        let nsError = self as NSError
+        let errorCode: String = .init(nsError.code)
+        let errorDescription: String = nsError.localizedDescription
+        // A GATT operation the peripheral refused carries its ATT error code, which no name lookup
+        // matches. CBErrorDomain reuses the same small numbers for other meanings, so the domain
+        // decides which table applies.
+        let mappedCode = nsError.domain == CBATTErrorDomain
+            ? attErrorToBleShieldNativeErrorCode(nsError.code)
+            : mapErrorCodeToEnum(errorCode)
+        return createFlutterError(code: mappedCode, message: errorDescription, details: errorCode)
+    }
+
+    /// Numeric code of the underlying NSError (e.g. `CBError.Code` for CoreBluetooth errors).
+    var nativeCode: Int64 {
+        Int64((self as NSError).code)
+    }
+
+    /// Classification of a connection failure / unexpected disconnect from `CBError.Code`.
+    var connectionErrorCode: BleShieldNativeErrorCode {
+        let nsError = self as NSError
+        guard nsError.domain == CBErrorDomain, let code = CBError.Code(rawValue: nsError.code) else {
+            return .unknownError
+        }
+        switch code {
+        case .connectionTimeout: return .connectionTimeout
+        case .peripheralDisconnected: return .deviceDisconnected
+        case .connectionFailed: return .connectionFailed
+        case .connectionLimitReached: return .connectionLimitExceeded
+        default: return .unknownError
+        }
+    }
+}
+
+/// CoreBluetooth keeps a per-bond cache of the peripheral's attribute table.
+/// When the device's GATT layout changes underneath that cache (for example,
+/// after a firmware update or handle remapping without a Service Changed indication),
+/// CoreBluetooth can build its attribute tree from the stale table and file an attribute of the
+/// wrong class into an array, such as a CBService among a service's characteristics.
+/// Swift's typed bridging of that NSArray traps with "NSArray element failed to match the
+/// Swift Array Element type" the moment it is iterated, causing an uncatchable app crash.
+/// These accessors read the arrays through KVC so no typed bridge runs, keep only the elements
+/// of the declared class, and report any foreign classes so callers can fail gracefully.
+public struct GattAttributeArray<Attribute: CBAttribute> {
+    public let attributes: [Attribute]?
+    public let foreignClassNames: [String]
+
+    public var hasForeign: Bool { !foreignClassNames.isEmpty }
+}
+
+public extension NSObject {
+    func gattAttributeArray<Attribute: CBAttribute>(forKey key: String) -> GattAttributeArray<Attribute> {
+        guard responds(to: NSSelectorFromString(key)) else {
+            return GattAttributeArray(attributes: nil, foreignClassNames: [])
+        }
+        guard let rawValue = value(forKey: key) else {
+            return GattAttributeArray(attributes: nil, foreignClassNames: [])
+        }
+        guard let raw = rawValue as? NSArray else {
+            return GattAttributeArray(
+                attributes: nil,
+                foreignClassNames: [String(describing: type(of: rawValue))]
+            )
+        }
+        var attributes: [Attribute] = []
+        var foreignClassNames: [String] = []
+        for item in raw {
+            if let attribute = item as? Attribute {
+                attributes.append(attribute)
+            } else {
+                foreignClassNames.append(String(describing: type(of: item)))
+            }
+        }
+        return GattAttributeArray(attributes: attributes, foreignClassNames: foreignClassNames)
+    }
+}
+
+public extension CBPeripheral {
+    var safeServices: GattAttributeArray<CBService> {
+        gattAttributeArray(forKey: "services")
+    }
+}
+
+public extension CBService {
+    var safeCharacteristics: GattAttributeArray<CBCharacteristic> {
+        gattAttributeArray(forKey: "characteristics")
+    }
+}
+
+public extension CBCharacteristic {
+    var safeDescriptors: GattAttributeArray<CBDescriptor> {
+        gattAttributeArray(forKey: "descriptors")
+    }
+}
+
+public extension CBUUID {
+    var uuidStr: String {
+        uuidString.lowercased()
+    }
+
+    /// The UUID in the canonical 128-bit lowercase form used across the plugin.
+    ///
+    /// CoreBluetooth preserves the width a UUID was advertised with, so a 16-bit
+    /// service UUID arrives as `181A` while the Dart layer always sends the full
+    /// 128-bit form. Comparing `CBUUID` values directly therefore misses 16-bit
+    /// UUIDs; compare these strings instead.
+    var uuid128Str: String {
+        let uuid = uuidString.lowercased()
+        switch uuid.count {
+        case 4: return "0000\(uuid)-0000-1000-8000-00805f9b34fb"
+        case 8: return "\(uuid)-0000-1000-8000-00805f9b34fb"
+        default: return uuid
+        }
+    }
+}
+
+public extension CBPeripheral {
+    var uuid: UUID {
+        identifier
+    }
+
+    func getCharacteristic(_ characteristic: String, of service: String) -> CBCharacteristic? {
+        let GSS_SUFFIX = "0000-1000-8000-00805f9b34fb"
+        let s = safeServices.attributes?.first {
+            $0.uuid.uuidStr.lowercased() == service.lowercased() || service.lowercased() == "0000\($0.uuid.uuidStr)-\(GSS_SUFFIX)".lowercased()
+        }
+        let c = s?.safeCharacteristics.attributes?.first {
+            $0.uuid.uuidStr.lowercased() == characteristic.lowercased() || characteristic.lowercased() == "0000\($0.uuid.uuidStr)-\(GSS_SUFFIX)".lowercased()
+        }
+        return c
+    }
+
+    func getDescriptor(_ descriptor: String, for characteristic: String, of service: String) -> CBDescriptor? {
+        let GSS_SUFFIX = "0000-1000-8000-00805f9b34fb"
+        guard let c = getCharacteristic(characteristic, of: service) else { return nil }
+        return c.safeDescriptors.attributes?.first {
+            $0.uuid.uuidStr.lowercased() == descriptor.lowercased() || descriptor.lowercased() == "0000\($0.uuid.uuidStr)-\(GSS_SUFFIX)".lowercased()
+        }
+    }
+
+    func setNotifiable(_ bleInputProperty: String, for characteristic: String, of service: String) {
+        guard let characteristic = getCharacteristic(characteristic, of: service) else {
+            return
+        }
+        setNotifyValue(bleInputProperty != "disabled", for: characteristic)
+    }
+}
+
+extension FlutterStandardTypedData {
+    func toData() -> Data {
+        return Data(data)
+    }
+}
+
+// Future protocol and implementations
+protocol DeviceFuture {
+    var deviceId: String { get }
+    func fail(with error: Error)
+}
+
+extension Array {
+    mutating func popFirst(where predicate: (Element) throws -> Bool) rethrows -> Element? {
+        guard let index = try firstIndex(where: predicate) else { return nil }
+        return remove(at: index)
+    }
+}
+
+extension Array where Element: DeviceFuture {
+    mutating func failAndRemoveAll(matching deviceId: String, with error: Error) {
+        removeAll { future in
+            if future.deviceId.caseInsensitiveCompare(deviceId) == .orderedSame {
+                future.fail(with: error)
+                return true
+            }
+            return false
+        }
+    }
+}
+
+class CharacteristicReadFuture: DeviceFuture {
+    let deviceId: String
+    let characteristicId: String
+    let serviceId: String?
+    let result: (Result<FlutterStandardTypedData, Error>) -> Void
+
+    init(deviceId: String, characteristicId: String, serviceId: String?, result: @escaping (Result<FlutterStandardTypedData, Error>) -> Void) {
+        self.deviceId = deviceId
+        self.characteristicId = characteristicId
+        self.serviceId = serviceId
+        self.result = result
+    }
+
+    func fail(with error: Error) {
+        result(.failure(error))
+    }
+}
+
+class CharacteristicWriteFuture: DeviceFuture {
+    let deviceId: String
+    let characteristicId: String
+    let serviceId: String?
+    let result: (Result<Void, Error>) -> Void
+
+    init(deviceId: String, characteristicId: String, serviceId: String?, result: @escaping (Result<Void, Error>) -> Void) {
+        self.deviceId = deviceId
+        self.characteristicId = characteristicId
+        self.serviceId = serviceId
+        self.result = result
+    }
+
+    func fail(with error: Error) {
+        result(.failure(error))
+    }
+}
+
+class PendingWriteWithoutResponse: DeviceFuture {
+    let deviceId: String
+    let characteristic: CBCharacteristic
+    let data: Data
+    let result: (Result<Void, Error>) -> Void
+
+    init(deviceId: String, characteristic: CBCharacteristic, data: Data, result: @escaping (Result<Void, Error>) -> Void) {
+        self.deviceId = deviceId
+        self.characteristic = characteristic
+        self.data = data
+        self.result = result
+    }
+
+    func fail(with error: Error) {
+        result(.failure(error))
+    }
+}
+
+class CharacteristicNotifyFuture: DeviceFuture {
+    let deviceId: String
+    let characteristicId: String
+    let serviceId: String?
+    let result: (Result<Void, Error>) -> Void
+
+    init(deviceId: String, characteristicId: String, serviceId: String?, result: @escaping (Result<Void, Error>) -> Void) {
+        self.deviceId = deviceId
+        self.characteristicId = characteristicId
+        self.serviceId = serviceId
+        self.result = result
+    }
+
+    func fail(with error: Error) {
+        result(.failure(error))
+    }
+}
+
+class DiscoverServicesFuture: DeviceFuture {
+    let deviceId: String
+    let result: (Result<[BleShieldNativeService], Error>) -> Void
+
+    init(deviceId: String, result: @escaping (Result<[BleShieldNativeService], Error>) -> Void) {
+        self.deviceId = deviceId
+        self.result = result
+    }
+
+    func fail(with error: Error) {
+        result(.failure(error))
+    }
+}
+
+class RssiReadFuture: DeviceFuture {
+    let deviceId: String
+    let result: (Result<Int64, Error>) -> Void
+
+    init(deviceId: String, result: @escaping (Result<Int64, Error>) -> Void) {
+        self.deviceId = deviceId
+        self.result = result
+    }
+
+    func fail(with error: Error) {
+        result(.failure(error))
+    }
+}
+
+class DescriptorReadFuture: DeviceFuture {
+    let deviceId: String
+    let descriptorId: String
+    let characteristicId: String
+    let serviceId: String?
+    let result: (Result<FlutterStandardTypedData, Error>) -> Void
+
+    init(deviceId: String, descriptorId: String, characteristicId: String, serviceId: String?, result: @escaping (Result<FlutterStandardTypedData, Error>) -> Void) {
+        self.deviceId = deviceId
+        self.descriptorId = descriptorId
+        self.characteristicId = characteristicId
+        self.serviceId = serviceId
+        self.result = result
+    }
+
+    func fail(with error: Error) {
+        result(.failure(error))
+    }
+}
+
+class DescriptorWriteFuture: DeviceFuture {
+    let deviceId: String
+    let descriptorId: String
+    let characteristicId: String
+    let serviceId: String?
+    let result: (Result<Void, Error>) -> Void
+
+    init(deviceId: String, descriptorId: String, characteristicId: String, serviceId: String?, result: @escaping (Result<Void, Error>) -> Void) {
+        self.deviceId = deviceId
+        self.descriptorId = descriptorId
+        self.characteristicId = characteristicId
+        self.serviceId = serviceId
+        self.result = result
+    }
+
+    func fail(with error: Error) {
+        result(.failure(error))
+    }
+}

@@ -1,0 +1,2115 @@
+package io.github.tganzerli.ble_shield
+
+import android.annotation.SuppressLint
+import android.app.Activity
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
+import android.bluetooth.BluetoothGattService
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import io.flutter.embedding.engine.plugins.FlutterPlugin
+import io.flutter.embedding.engine.plugins.activity.ActivityAware
+import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
+import io.flutter.plugin.common.PluginRegistry
+import java.util.Collections
+import java.util.UUID
+import java.util.WeakHashMap
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import androidx.core.content.edit
+
+@SuppressLint("MissingPermission")
+class BleShieldPlugin : BleShieldNativePlatformChannel, BluetoothGattCallback(), FlutterPlugin,
+    ActivityAware, PluginRegistry.ActivityResultListener,
+    PluginRegistry.RequestPermissionsResultListener {
+    // ble_shield: own request codes. Sharing universal_ble's would make two plugins
+    // on the same Activity consume each other's results. Kept within 16 bits, as
+    // FragmentActivity requires.
+    private val bluetoothEnableRequestCode = 0x4251
+    private val bluetoothDisableRequestCode = 0x4252
+    private val permissionRequestCode = 0x4253
+    private var permissionHandler: PermissionHandler? = null
+    private var callbackChannel: BleShieldNativeCallbackChannel? = null
+
+    // Read on Bluetooth binder threads (from GATT callbacks) but assigned on the
+    // main thread in onAttachedToEngine/onDetachedFromEngine; @Volatile makes
+    // those writes visible so a binder thread never sees a stale null and drops
+    // a completion.
+    @Volatile
+    private var mainThreadHandler: Handler? = null
+    private lateinit var context: Context
+    private var activity: Activity? = null
+    private lateinit var bluetoothManager: BluetoothManager
+    private lateinit var safeScanner: SafeScanner
+    private val cachedServicesMap = mutableMapOf<String, List<String>>()
+    private val bleShieldNativeFilterUtil = BleShieldNativeFilterUtil()
+
+    // Flutter Futures
+    private var bluetoothEnableRequestFuture: ((Result<Boolean>) -> Unit)? = null
+    private var bluetoothDisableRequestFuture: ((Result<Boolean>) -> Unit)? = null
+    private val discoverServicesFutureList = mutableListOf<DiscoverServicesFuture>()
+    private val mtuResultFutureList = mutableListOf<MtuResultFuture>()
+    // Protected by mtuResultFutureList's lock. An observed MTU belongs to this
+    // GATT client, never to a later connection using the same device address.
+    private val negotiatedMtus = WeakHashMap<BluetoothGatt, Int>()
+    private val readResultFutureList = mutableListOf<ReadResultFuture>()
+    private val writeResultFutureList = mutableListOf<WriteResultFuture>()
+    private val readDescriptorResultFutureList = mutableListOf<ReadDescriptorResultFuture>()
+    private val writeDescriptorResultFutureList = mutableListOf<WriteDescriptorResultFuture>()
+    private val subscriptionResultFutureList = mutableListOf<SubscriptionResultFuture>()
+    private val pairResultFutures = mutableMapOf<String, (Result<Boolean>) -> Unit>()
+
+    // Addresses seen go through BOND_BONDING. A return to BOND_NONE while an address is in here is a
+    // failed/declined bond (an event), not a steady BOND_NONE, so onBondStateUpdate() marks it as a failure
+    // instead of letting Dart's pairing-state dedup swallow it (#325).
+    private val bondingAttempts = mutableSetOf<String>()
+    private val rssiResultFutureList = mutableListOf<RssiResultFuture>()
+    private val autoConnectDevices = mutableSetOf<String>()
+
+    // GATT clients that reached STATE_CONNECTED, so a later STATE_DISCONNECTED can be told
+    // apart from a failed connection attempt (Android reports both the same way).
+    private val connectedGatts: MutableSet<BluetoothGatt> =
+        Collections.newSetFromMap(ConcurrentHashMap<BluetoothGatt, Boolean>())
+
+    // Per plugin instance (one per FlutterEngine): the GATT clients this engine
+    // owns (see [GattRegistry]). A connect() here never reuses a client from
+    // another engine, and detach releases only this engine's clients.
+    private val gattRegistry = GattRegistry()
+
+    /**
+     * When enabled, close every known GATT client on engine detach. The
+     * plugin otherwise leaves GATT open, so a killed app keeps the
+     * peripheral occupied until its supervision timeout.
+     */
+    private var closeGattOnDetach = false
+
+    // Clients that disconnect() is tearing down; closed on STATE_DISCONNECTED or by the fallback timer.
+    private val closingGatts: MutableSet<BluetoothGatt> =
+        Collections.newSetFromMap(ConcurrentHashMap<BluetoothGatt, Boolean>())
+    private val gattCloseTimeoutMs = 1500L
+
+    override fun onAttachedToEngine(flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
+        context = flutterPluginBinding.applicationContext
+        mainThreadHandler = Handler(Looper.getMainLooper())
+        permissionHandler = PermissionHandler(
+            context,
+            permissionRequestCode,
+        )
+        bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+        safeScanner = SafeScanner(bluetoothManager)
+
+        BleShieldNativePlatformChannel.setUp(flutterPluginBinding.binaryMessenger, this)
+        callbackChannel = BleShieldNativeCallbackChannel(flutterPluginBinding.binaryMessenger)
+
+
+        val intentFilter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+        intentFilter.addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
+        context.registerReceiverCompat(broadcastReceiver, intentFilter, exported = true)
+        cachedServicesMap.putAll(getCachedServicesMap())
+    }
+
+    override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        // Release only the clients this engine created. The snapshot avoids mutating
+        // the map while clients are released.
+        if (closeGattOnDetach) gattRegistry.snapshot().forEach(::cleanConnection)
+        bluetoothManager.adapter.bluetoothLeScanner?.stopScan(scanCallback)
+        context.unregisterReceiver(broadcastReceiver)
+        callbackChannel = null
+        mainThreadHandler = null
+        permissionHandler = null
+    }
+
+    override fun getBluetoothAvailabilityState(callback: (Result<AvailabilityState>) -> Unit) {
+        callback(
+            Result.success(
+                bluetoothManager.adapter?.state?.toAvailabilityState()
+                    ?: AvailabilityState.UNKNOWN
+            )
+        )
+    }
+
+    override fun hasPermissions(withAndroidFineLocation: Boolean): Boolean {
+        return permissionHandler?.hasPermissions(withAndroidFineLocation) ?: false
+    }
+
+    override fun requestPermissions(
+        withAndroidFineLocation: Boolean,
+        callback: (Result<Unit>) -> Unit,
+    ) {
+        if (permissionHandler == null) {
+            callback(
+                Result.failure(
+                    createFlutterError(
+                        BleShieldNativeErrorCode.FAILED,
+                        "PermissionHandler is not initialized"
+                    )
+                )
+            )
+        }
+        permissionHandler?.requestPermissions(withAndroidFineLocation, callback)
+    }
+
+    override fun enableBluetooth(callback: (Result<Boolean>) -> Unit) {
+        if (bluetoothManager.adapter.isEnabled) {
+            callback(Result.success(true))
+            return
+        }
+        if (bluetoothEnableRequestFuture != null) {
+            callback(
+                Result.failure(
+                    createFlutterError(
+                        BleShieldNativeErrorCode.OPERATION_IN_PROGRESS,
+                        "Bluetooth enable request in progress"
+                    )
+                )
+            )
+            return
+        }
+        val enableBtIntent = Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE)
+        activity?.startActivityForResult(enableBtIntent, bluetoothEnableRequestCode)
+        bluetoothEnableRequestFuture = callback
+    }
+
+    override fun disableBluetooth(callback: (Result<Boolean>) -> Unit) {
+        if (!bluetoothManager.adapter.isEnabled) {
+            callback(Result.success(true))
+            return
+        }
+        if (bluetoothDisableRequestFuture != null) {
+            callback(
+                Result.failure(
+                    createFlutterError(
+                        BleShieldNativeErrorCode.OPERATION_IN_PROGRESS,
+                        "Bluetooth disable request in progress"
+                    )
+                )
+            )
+            return
+        }
+        val disableBtIntent = Intent("android.bluetooth.adapter.action.REQUEST_DISABLE")
+        activity?.startActivityForResult(disableBtIntent, bluetoothDisableRequestCode)
+        bluetoothDisableRequestFuture = callback
+    }
+
+    override fun startScan(filter: UniversalScanFilter?, config: UniversalScanConfig?) {
+        if (!isBluetoothAvailable()) throw createFlutterError(
+            BleShieldNativeErrorCode.BLUETOOTH_NOT_ENABLED,
+            "Bluetooth not enabled"
+        )
+
+        val builder = ScanSettings.Builder()
+        val legacy = config?.android?.legacy
+        config?.android?.let { androidConfig ->
+            androidConfig.scanMode?.parse()?.let { scanMode ->
+                builder.setScanMode(scanMode)
+            }
+            androidConfig.reportDelayMillis?.let { reportDelay ->
+                builder.setReportDelay(reportDelay)
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                androidConfig.callbackType?.let { types ->
+                    val combined = types.mapNotNull { it.parse() }.fold(0) { acc, v -> acc or v }
+                    if (combined != 0) builder.setCallbackType(combined)
+                }
+                androidConfig.matchMode?.parse()?.let { builder.setMatchMode(it) }
+                androidConfig.numOfMatches?.parse()?.let { builder.setNumOfMatches(it) }
+
+                // Battery-friendly de-duplication: report only the first match per
+                // device (mirrors iOS's CBCentralManagerScanOptionAllowDuplicatesKey
+                // = false) unless the caller overrode callbackType. First-match
+                // filtering is offloaded to the controller, so only request it when
+                // the adapter supports it; otherwise startScan() fails with
+                // SCAN_FAILED_FEATURE_UNSUPPORTED (and the failure is only logged).
+                // The Dart layer de-duplicates regardless of this native lever.
+                if (config?.skipDuplicates == true &&
+                    androidConfig.callbackType == null &&
+                    supportsFirstMatchScan()
+                ) {
+                    builder.setCallbackType(ScanSettings.CALLBACK_TYPE_FIRST_MATCH)
+                }
+            }
+        }
+        if (Build.VERSION.SDK_INT >= 26) {
+            if (legacy == true) {
+                builder.setLegacy(true)
+            } else {
+                builder.setPhy(ScanSettings.PHY_LE_ALL_SUPPORTED)
+                builder.setLegacy(false)
+            }
+        }
+        val settings = builder.build()
+
+        val usesCustomFilters = filter?.usesCustomFilters() ?: false
+
+        try {
+            val filterServices = filter?.withServices?.toUUIDList() ?: emptyList()
+            var scanFilters = emptyList<ScanFilter>()
+
+            // Set custom scan filter only if required
+            if (usesCustomFilters) {
+                BleShieldNativeLogger.logError("Using Custom Filters")
+                bleShieldNativeFilterUtil.configure(filter)
+            } else {
+                bleShieldNativeFilterUtil.configure(null)
+                scanFilters = filter?.toScanFilters(filterServices) ?: emptyList()
+            }
+
+            safeScanner.startScan(
+                scanFilters, settings, scanCallback
+            )
+        } catch (e: Exception) {
+            throw createFlutterError(
+                BleShieldNativeErrorCode.FAILED,
+                "Failed to start Scan",
+                details = e.toString()
+            )
+        }
+    }
+
+    override fun stopScan() {
+        if (!isBluetoothAvailable()) throw createFlutterError(
+            BleShieldNativeErrorCode.BLUETOOTH_NOT_ENABLED,
+            "Bluetooth not enabled"
+        )
+        // check if already scanning
+        safeScanner.stopScan(scanCallback)
+    }
+
+    override fun isScanning(): Boolean {
+        return safeScanner.isScanning()
+    }
+
+    override fun requestDevice(
+        options: AppleAccessorySetupOptions,
+        callback: (Result<UniversalDevicePickerResult>) -> Unit,
+    ) {
+        callback(
+            Result.failure(
+                createFlutterError(
+                    BleShieldNativeErrorCode.NOT_SUPPORTED,
+                    "AccessorySetupKit is only supported on iOS 18+",
+                )
+            )
+        )
+    }
+
+    override fun connect(
+        deviceId: String,
+        autoConnect: Boolean?,
+        platformConfig: ConnectionPlatformConfig?,
+    ) {
+        platformConfig?.android?.closeGattOnDetach?.let { closeGattOnDetach = it }
+
+        // Note: platformConfig carries platform-specific connection options
+        // If already connected, send connected message,
+        // if connecting, do nothing
+        gattRegistry.find(deviceId)?.let {
+            val currentState = bluetoothManager.getConnectionState(it.device, BluetoothProfile.GATT)
+            if (currentState == BluetoothGatt.STATE_CONNECTED) {
+                BleShieldNativeLogger.logError("$deviceId Already connected")
+                mainThreadHandler?.post {
+                    callbackChannel?.onConnectionChanged(deviceId, true, null, null, null) {}
+                }
+                return
+            } else if (currentState == BluetoothGatt.STATE_CONNECTING) {
+                throw createFlutterError(
+                    BleShieldNativeErrorCode.CONNECTION_IN_PROGRESS,
+                    "Connection already in progress"
+                )
+            }
+        }
+
+        val shouldAutoConnect = autoConnect ?: false
+        // One client per device. A client that is neither CONNECTED nor CONNECTING is a pending
+        // autoConnect (kept open by onConnectionStateChange so Android reconnects it) or a client
+        // between connections. Reuse a live autoConnect request for a new autoConnect; otherwise
+        // release the old client synchronously, before connectGatt, so no orphan keeps a
+        // connection or a background connect alive. Not via cleanConnection: its delayed close()
+        // and onConnectionChanged would race the new client.
+        gattRegistry.find(deviceId)?.let { old ->
+            if (shouldAutoConnect && autoConnectDevices.contains(deviceId)) {
+                BleShieldNativeLogger.logDebug("$deviceId reusing the pending autoConnect client")
+                return
+            }
+            BleShieldNativeLogger.logDebug("$deviceId closing the previous gatt before connecting")
+            gattRegistry.remove(old)
+            connectedGatts.remove(old)
+            closingGatts.remove(old)
+            old.disconnect()
+            old.close()
+        }
+        if (shouldAutoConnect) {
+            autoConnectDevices.add(deviceId)
+        } else {
+            autoConnectDevices.remove(deviceId)
+        }
+        val remoteDevice = bluetoothManager.adapter.getRemoteDevice(deviceId)
+        val gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            remoteDevice.connectGatt(
+                context,
+                shouldAutoConnect,
+                this,
+                BluetoothDevice.TRANSPORT_LE
+            )
+        } else {
+            remoteDevice.connectGatt(context, shouldAutoConnect, this)
+        }
+        gattRegistry.put(gatt)?.let { replaced ->
+            // Unreachable after the release above; kept so a future path cannot orphan a client.
+            BleShieldNativeLogger.logError("$deviceId replaced an unreleased gatt, closing it")
+            replaced.disconnect()
+            replaced.close()
+        }
+    }
+
+    override fun disconnect(deviceId: String) {
+        autoConnectDevices.remove(deviceId)
+        val gatt = gattRegistry.find(deviceId)
+        if (gatt == null) {
+            cleanUpConnection(deviceId)
+            mainThreadHandler?.post {
+                callbackChannel?.onConnectionChanged(deviceId, false, null, null, null) {}
+            }
+        } else {
+            cleanConnection(gatt)
+        }
+    }
+
+    override fun getConnectionState(deviceId: String): BleConnectionState {
+        try {
+            val connectionState = bluetoothManager.getConnectionState(
+                bluetoothManager.adapter.getRemoteDevice(deviceId),
+                BluetoothProfile.GATT
+            )
+            return if (gattRegistry.isKnown(deviceId) || connectionState == BluetoothGatt.STATE_DISCONNECTED || connectionState == BluetoothGatt.STATE_DISCONNECTING) {
+                connectionState.toBleConnectionState()
+            } else {
+                // Might be connected with device, but not with app
+                BleShieldNativeLogger.logError("Device might be connected but not known to this app")
+                BleConnectionState.DISCONNECTED
+            }
+        } catch (_: Exception) {
+            return BleConnectionState.DISCONNECTED
+        }
+    }
+
+    override fun setLogLevel(logLevel: BleLogLevel) {
+        BleShieldNativeLogger.setLogLevel(logLevel)
+    }
+
+    override fun readRssi(deviceId: String, callback: (Result<Long>) -> Unit) {
+        try {
+            val gatt = gattRegistry.get(deviceId)
+            if (gatt.readRemoteRssi()) {
+                // Pending futures are mutated both here (main thread) and in
+                // onReadRemoteRssi / cleanUpConnection (binder threads), so
+                // every access must hold the list's lock.
+                synchronized(rssiResultFutureList) {
+                    rssiResultFutureList.add(RssiResultFuture(deviceId, callback))
+                }
+            } else {
+                callback(
+                    Result.failure(
+                        createFlutterError(
+                            BleShieldNativeErrorCode.FAILED,
+                            "Failed to read RSSI"
+                        )
+                    )
+                )
+            }
+        } catch (e: FlutterError) {
+            callback(Result.failure(e))
+        }
+    }
+
+    override fun onReadRemoteRssi(gatt: BluetoothGatt?, rssi: Int, status: Int) {
+        val deviceId = gatt?.device?.address ?: return
+        // Runs on a binder thread: match and remove under the lock, then
+        // complete on the main thread (platform-channel replies must be sent
+        // there). Every readRemoteRssi() has its own response, so this callback
+        // belongs to the oldest pending request only — completing every match
+        // would report one reading to a request still in flight.
+        val future: RssiResultFuture?
+        synchronized(rssiResultFutureList) {
+            future = rssiResultFutureList.firstOrNull { it.deviceId == deviceId }
+            future?.let { rssiResultFutureList.remove(it) }
+        }
+        if (future == null) {
+            return
+        }
+        postToMainLooper {
+            try {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    future.result(Result.success(rssi.toLong()))
+                } else {
+                    future.result(
+                        Result.failure(
+                            createFlutterError(
+                                BleShieldNativeErrorCode.FAILED,
+                                "Failed to read RSSI"
+                            )
+                        )
+                    )
+                }
+            } catch (e: Exception) {
+                BleShieldNativeLogger.logError("RSSI completion delivery failed: $e")
+            }
+        }
+    }
+
+    override fun discoverServices(
+        deviceId: String,
+        withDescriptors: Boolean,
+        platformConfig: DiscoverServicesPlatformConfig?,
+        callback: (Result<List<BleShieldNativeService>>) -> Unit,
+    ) {
+        try {
+            val gatt = gattRegistry.get(deviceId)
+            if (platformConfig?.android?.clearGattCache == true && !gatt.refreshGattCache()) {
+                callback(
+                    Result.failure(
+                        createFlutterError(
+                            BleShieldNativeErrorCode.FAILED,
+                            "Failed to clear GATT cache"
+                        )
+                    )
+                )
+                return
+            }
+            if (gatt.discoverServices()) {
+                // Pending futures are mutated both here (main thread) and in
+                // onServicesDiscovered / cleanUpConnection (binder threads), so
+                // every access must hold the list's lock.
+                synchronized(discoverServicesFutureList) {
+                    discoverServicesFutureList.add(
+                        DiscoverServicesFuture(
+                            deviceId,
+                            withDescriptors,
+                            callback
+                        )
+                    )
+                }
+            } else {
+                callback(
+                    Result.failure(
+                        createFlutterError(
+                            BleShieldNativeErrorCode.FAILED,
+                            "Failed to discover services"
+                        )
+                    )
+                )
+            }
+        } catch (e: FlutterError) {
+            callback(Result.failure(e))
+        }
+    }
+
+    override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+        val deviceId = gatt.device.address
+        // Runs on a binder thread. Read the services before taking the pending
+        // futures: this throws once the link is gone, and a future removed
+        // without a result would never complete.
+        val services: List<BluetoothGattService>? =
+            if (status == BluetoothGatt.GATT_SUCCESS) gatt.services else null
+        val pending: List<DiscoverServicesFuture>
+        synchronized(discoverServicesFutureList) {
+            pending = discoverServicesFutureList.filter { it.deviceId == deviceId }
+            discoverServicesFutureList.removeAll(pending)
+        }
+        if (services != null) {
+            try {
+                setCachedServices(deviceId, services.map { it.uuid.toString() })
+            } catch (e: Exception) {
+                // The cache is best-effort: the callers below still need their
+                // result, and a detached plugin has no context to write to.
+                BleShieldNativeLogger.logError("DISCOVER_CACHE_FAILED <- $deviceId $e")
+            }
+        }
+        // A discovery result belongs to the device, not to a single caller, so
+        // every pending caller gets it. Complete on the main thread (platform
+        // channel replies must be sent there), one callback at a time, so a
+        // throwing handler cannot swallow the rest.
+        for (future in pending) {
+            postToMainLooper {
+                val result: Result<List<BleShieldNativeService>> = if (services == null) {
+                    Result.failure(
+                        createFlutterError(
+                            BleShieldNativeErrorCode.FAILED,
+                            "Failed to discover services"
+                        )
+                    )
+                } else {
+                    try {
+                        Result.success(services.map { service ->
+                            BleShieldNativeService(
+                                uuid = service.uuid.toString(),
+                                characteristics = service.characteristics.map { char ->
+                                    BleShieldNativeCharacteristic(
+                                        uuid = char.uuid.toString(),
+                                        properties = char.getPropertiesList(),
+                                        descriptors = if (future.withDescriptors) char.descriptors.map { descriptor ->
+                                            BleShieldNativeDescriptor(descriptor.uuid.toString())
+                                        } else listOf()
+                                    )
+                                }
+                            )
+                        })
+                    } catch (e: Exception) {
+                        BleShieldNativeLogger.logError(
+                            "DISCOVER_FAILED <- $deviceId $e"
+                        )
+                        Result.failure(
+                            createFlutterError(
+                                BleShieldNativeErrorCode.FAILED,
+                                "Failed to discover services",
+                                e.toString()
+                            )
+                        )
+                    }
+                }
+                try {
+                    future.result(result)
+                } catch (e: Exception) {
+                    BleShieldNativeLogger.logError(
+                        "Discover services completion delivery failed: $e"
+                    )
+                }
+            }
+        }
+    }
+
+
+    override fun setNotifiable(
+        deviceId: String,
+        service: String,
+        characteristic: String,
+        bleInputProperty: BleInputProperty,
+        callback: (Result<Unit>) -> Unit,
+    ) {
+        try {
+            BleShieldNativeLogger.logDebug("SET_NOTIFY -> $deviceId $service $characteristic input=$bleInputProperty")
+            val gatt = gattRegistry.get(deviceId)
+            val gattCharacteristic: BluetoothGattCharacteristic? =
+                gatt.getCharacteristic(service, characteristic)
+
+            if (gattCharacteristic == null) {
+                callback(
+                    Result.failure(
+                        createFlutterError(
+                            BleShieldNativeErrorCode.CHARACTERISTIC_NOT_FOUND,
+                            "characteristic not found"
+                        )
+                    )
+                )
+                return
+            }
+
+            val descriptor: BluetoothGattDescriptor? =
+                gattCharacteristic.getDescriptor(ccdCharacteristic)
+
+            val (value, enable) = when (bleInputProperty) {
+                BleInputProperty.NOTIFICATION -> BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE to true
+                BleInputProperty.INDICATION -> BluetoothGattDescriptor.ENABLE_INDICATION_VALUE to true
+                else -> BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE to false
+            }
+
+            if (descriptor != null) {
+                // Some devices do not need CCCD to update
+                @Suppress("DEPRECATION")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    val status = gatt.writeDescriptor(descriptor, value)
+                    if (status != BluetoothStatusCodes.SUCCESS) {
+                        callback(
+                            Result.failure(
+                                createFlutterError(
+                                    status.parseBluetoothStatusCodeError()
+                                        ?: BleShieldNativeErrorCode.FAILED,
+                                    "Failed to update descriptor"
+                                )
+                            )
+                        )
+                        return
+                    }
+                } else {
+                    descriptor.value = value
+                    if (!gatt.writeDescriptor(descriptor)) {
+                        callback(
+                            Result.failure(
+                                createFlutterError(
+                                    BleShieldNativeErrorCode.FAILED,
+                                    "Failed to update descriptor"
+                                )
+                            )
+                        )
+                        return
+                    }
+                }
+            } else {
+                BleShieldNativeLogger.logDebug("CCCD Descriptor not found")
+            }
+
+            if (gatt.setCharacteristicNotification(gattCharacteristic, enable)) {
+                if (descriptor != null) {
+                    // Completed by updateSubscriptionState on a binder thread.
+                    synchronized(subscriptionResultFutureList) {
+                        subscriptionResultFutureList.add(
+                            SubscriptionResultFuture(
+                                gatt.device.address,
+                                gattCharacteristic.uuid.toString(),
+                                gattCharacteristic.service.uuid.toString(),
+                                callback
+                            )
+                        )
+                    }
+                } else {
+                    callback(Result.success(Unit))
+                }
+            } else {
+                callback(
+                    Result.failure(
+                        createFlutterError(
+                            BleShieldNativeErrorCode.FAILED,
+                            "Failed to update subscription state"
+                        )
+                    )
+                )
+            }
+        } catch (e: FlutterError) {
+            callback(Result.failure(e))
+        } catch (e: Exception) {
+            callback(
+                Result.failure(
+                    createFlutterError(
+                        BleShieldNativeErrorCode.FAILED,
+                        "Failed to update subscription state",
+                        e.toString()
+                    )
+                )
+            )
+        }
+    }
+
+    override fun readValue(
+        deviceId: String,
+        service: String,
+        characteristic: String,
+        callback: (Result<ByteArray>) -> Unit,
+    ) {
+        try {
+            BleShieldNativeLogger.logDebug("READ -> $deviceId $service $characteristic")
+            val gatt = gattRegistry.get(deviceId)
+            val gattCharacteristic = gatt.getCharacteristic(service, characteristic)
+            if (gattCharacteristic == null) {
+                callback(
+                    Result.failure(
+                        createFlutterError(
+                            BleShieldNativeErrorCode.CHARACTERISTIC_NOT_FOUND,
+                            "Unknown characteristic"
+                        )
+                    )
+                )
+                return
+            }
+            // Register before issuing the read, as writeValue does: the response
+            // arrives on a binder thread and a future added afterwards is never
+            // matched (the callback finds nothing to complete), leaving the Dart
+            // call awaiting forever. Every access to the list holds its lock.
+            val readFuture = ReadResultFuture(
+                gatt.device.address,
+                gattCharacteristic.uuid.toString(),
+                gattCharacteristic.service.uuid.toString(),
+                callback
+            )
+            synchronized(readResultFutureList) {
+                readResultFutureList.add(readFuture)
+            }
+
+            val started = try {
+                gatt.readCharacteristic(gattCharacteristic)
+            } catch (e: Exception) {
+                // A callback or disconnect may already own the reply.
+                synchronized(readResultFutureList) {
+                    if (!readResultFutureList.remove(readFuture)) return
+                }
+                throw e
+            }
+            if (!started) {
+                synchronized(readResultFutureList) {
+                    if (!readResultFutureList.remove(readFuture)) return
+                }
+                callback(
+                    Result.failure(
+                        createFlutterError(
+                            BleShieldNativeErrorCode.CHARACTERISTIC_NOT_FOUND,
+                            "$characteristic not found",
+                        )
+                    )
+                )
+            }
+        } catch (e: FlutterError) {
+            callback(Result.failure(e))
+        } catch (e: Exception) {
+            callback(
+                Result.failure(
+                    createFlutterError(
+                        BleShieldNativeErrorCode.READ_FAILED,
+                        "Failed to read value",
+                        e.toString()
+                    )
+                )
+            )
+        }
+    }
+
+    override fun onCharacteristicRead(
+        gatt: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic,
+        value: ByteArray,
+        status: Int,
+    ) {
+        // Runs on a binder thread: match and remove under the lock, then
+        // complete on the main thread (platform-channel replies must be sent
+        // there). Every readCharacteristic() has its own response, so this
+        // callback belongs to the oldest pending read of that characteristic —
+        // completing every match would acknowledge reads still in flight.
+        // The service must match exactly, as onCharacteristicWrite requires: a
+        // device+characteristic-only fallback can complete a read issued for
+        // another service that exposes the same characteristic UUID (HID
+        // report characteristics).
+        val deviceId = gatt.device.address
+        val characteristicId = characteristic.uuid.toString()
+        val serviceUuid = characteristic.service?.uuid?.toString()
+        val future: ReadResultFuture?
+        synchronized(readResultFutureList) {
+            future = readResultFutureList.firstOrNull {
+                it.deviceId == deviceId &&
+                    it.characteristicId == characteristicId &&
+                    it.serviceId == serviceUuid
+            }
+            future?.let { readResultFutureList.remove(it) }
+        }
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+            BleShieldNativeLogger.logError(
+                "READ_FAILED <- $deviceId $characteristicId status=$status"
+            )
+        }
+        if (future == null) {
+            return
+        }
+        postToMainLooper {
+            try {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    future.result(Result.success(value))
+                } else {
+                    future.result(
+                        Result.failure(
+                            createFlutterError(
+                                gattStatusToBleShieldNativeErrorCode(status),
+                                "Failed to read",
+                                status.toString()
+                            )
+                        )
+                    )
+                }
+            } catch (e: Exception) {
+                BleShieldNativeLogger.logError("Read completion delivery failed: $e")
+            }
+        }
+    }
+
+    override fun writeValue(
+        deviceId: String,
+        service: String,
+        characteristic: String,
+        value: ByteArray,
+        bleOutputProperty: BleOutputProperty,
+        callback: (Result<Unit>) -> Unit,
+    ) {
+        try {
+            BleShieldNativeLogger.logDebug("WRITE -> $deviceId $service $characteristic len=${value.size} property=$bleOutputProperty")
+            val gatt = gattRegistry.get(deviceId)
+            val gattCharacteristic = gatt.getCharacteristic(service, characteristic)
+            if (gattCharacteristic == null) {
+                callback(
+                    Result.failure(
+                        createFlutterError(
+                            BleShieldNativeErrorCode.CHARACTERISTIC_NOT_FOUND,
+                            "$characteristic not found",
+                        )
+                    )
+                )
+                return
+            }
+
+            var writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            if (bleOutputProperty == BleOutputProperty.WITH_RESPONSE) {
+                if (gattCharacteristic.properties and BluetoothGattCharacteristic.PROPERTY_WRITE == 0) {
+                    callback(
+                        Result.failure(
+                            createFlutterError(
+                                BleShieldNativeErrorCode.CHARACTERISTIC_DOES_NOT_SUPPORT_WRITE,
+                                "Characteristic does not support write withResponse"
+                            )
+                        )
+                    )
+                    return
+                }
+                writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            } else if (bleOutputProperty == BleOutputProperty.WITHOUT_RESPONSE) {
+                if (gattCharacteristic.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE == 0) {
+                    callback(
+                        Result.failure(
+                            createFlutterError(
+                                BleShieldNativeErrorCode.CHARACTERISTIC_DOES_NOT_SUPPORT_WRITE_WITHOUT_RESPONSE,
+                                "Characteristic does not support write withoutResponse"
+                            )
+                        )
+                    )
+                    return
+                }
+                writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+            }
+
+
+            val writeFuture = WriteResultFuture(
+                gatt.device.address,
+                gattCharacteristic.uuid.toString(),
+                gattCharacteristic.service.uuid.toString(),
+                callback
+            )
+
+            // Wait for the result. The list is mutated both here (main thread)
+            // and in onCharacteristicWrite / cleanUpConnection (Bluetooth
+            // binder threads), so every access must hold the lock.
+            synchronized(writeResultFutureList) {
+                writeResultFutureList.add(writeFuture)
+            }
+
+            val result = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                gatt.writeCharacteristic(gattCharacteristic, value, writeType)
+            } else {
+                @Suppress("DEPRECATION")
+                gattCharacteristic.value = value
+                gattCharacteristic.writeType = writeType
+                @Suppress("DEPRECATION")
+                val status = gatt.writeCharacteristic(gattCharacteristic)
+                if (status) BluetoothGatt.GATT_SUCCESS else BluetoothGatt.GATT_FAILURE
+            }
+
+            if (result != BluetoothGatt.GATT_SUCCESS) {
+                synchronized(writeResultFutureList) {
+                    writeResultFutureList.remove(writeFuture)
+                }
+                callback(
+                    Result.failure(
+                        createFlutterError(
+                            gattStatusToBleShieldNativeErrorCode(result),
+                            "Failed to write",
+                            result.toString()
+                        )
+                    )
+                )
+            }
+        } catch (e: FlutterError) {
+            callback(Result.failure(e))
+        }
+    }
+
+    // Deliver on the main looper. Platform-channel replies must be sent there,
+    // and because matching futures are removed from their list before delivery,
+    // a completion must never be dropped just because the cached handler was
+    // cleared (a GATT callback racing onDetachedFromEngine) — that would leak
+    // the pending Dart await. Fall back to a fresh main-looper handler so the
+    // completion is always attempted.
+    private fun postToMainLooper(action: () -> Unit) {
+        (mainThreadHandler ?: Handler(Looper.getMainLooper())).post(action)
+    }
+
+    override fun onCharacteristicWrite(
+        gatt: BluetoothGatt?,
+        characteristic: BluetoothGattCharacteristic,
+        status: Int,
+    ) {
+        // Runs on a binder thread: remove the matching future under the lock,
+        // then complete it on the main thread (platform-channel replies must
+        // be sent there), individually contained so a bad callback can neither
+        // corrupt the list nor block later completions. Android serializes
+        // GATT operations per device, so this callback always belongs to the
+        // OLDEST pending write on this characteristic — completing every match
+        // would acknowledge later writes that are still in flight (or not yet
+        // accepted natively) with this operation's status.
+        val future: WriteResultFuture?
+        synchronized(writeResultFutureList) {
+            future = writeResultFutureList.firstOrNull {
+                it.deviceId == gatt?.device?.address &&
+                    it.characteristicId == characteristic.uuid.toString() &&
+                    it.serviceId == characteristic.service?.uuid?.toString()
+            }
+            future?.let { writeResultFutureList.remove(it) }
+        }
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+            BleShieldNativeLogger.logError(
+                "WRITE_FAILED <- ${gatt?.device?.address} ${characteristic.uuid} status=$status"
+            )
+        }
+        if (future != null) {
+            postToMainLooper {
+                try {
+                    if (status == BluetoothGatt.GATT_SUCCESS) {
+                        future.result(Result.success(Unit))
+                    } else {
+                        future.result(
+                            Result.failure(
+                                createFlutterError(
+                                    gattStatusToBleShieldNativeErrorCode(status),
+                                    "Failed to write",
+                                    status.toString()
+                                )
+                            )
+                        )
+                    }
+                } catch (e: Exception) {
+                    BleShieldNativeLogger.logError("Write completion delivery failed: $e")
+                }
+            }
+        }
+    }
+
+    override fun readDescriptorValue(
+        deviceId: String,
+        service: String,
+        characteristic: String,
+        descriptor: String,
+        callback: (Result<ByteArray>) -> Unit,
+    ) {
+        try {
+            BleShieldNativeLogger.logDebug("READ_DESCRIPTOR -> $deviceId $service $characteristic $descriptor")
+            val gatt = gattRegistry.get(deviceId)
+            val gattCharacteristic = gatt.getCharacteristic(service, characteristic)
+            if (gattCharacteristic == null) {
+                callback(
+                    Result.failure(
+                        createFlutterError(
+                            BleShieldNativeErrorCode.CHARACTERISTIC_NOT_FOUND,
+                            "Characteristic not found"
+                        )
+                    )
+                )
+                return
+            }
+            val gattDescriptor = gattCharacteristic.getDescriptor(UUID.fromString(descriptor))
+            if (gattDescriptor == null) {
+                callback(
+                    Result.failure(
+                        createFlutterError(
+                            BleShieldNativeErrorCode.CHARACTERISTIC_NOT_FOUND,
+                            "Descriptor not found"
+                        )
+                    )
+                )
+                return
+            }
+            if (!gatt.readDescriptor(gattDescriptor)) {
+                callback(
+                    Result.failure(
+                        createFlutterError(
+                            BleShieldNativeErrorCode.READ_FAILED,
+                            "Failed to read descriptor"
+                        )
+                    )
+                )
+                return
+            }
+            synchronized(readDescriptorResultFutureList) {
+                readDescriptorResultFutureList.add(
+                    ReadDescriptorResultFuture(
+                        gatt.device.address,
+                        gattDescriptor.uuid.toString(),
+                        gattCharacteristic.uuid.toString(),
+                        gattCharacteristic.service.uuid.toString(),
+                        callback
+                    )
+                )
+            }
+        } catch (e: FlutterError) {
+            callback(Result.failure(e))
+        } catch (e: Exception) {
+            callback(
+                Result.failure(
+                    createFlutterError(
+                        BleShieldNativeErrorCode.READ_FAILED,
+                        "Failed to read descriptor value",
+                        e.toString()
+                    )
+                )
+            )
+        }
+    }
+
+    override fun onDescriptorRead(
+        gatt: BluetoothGatt,
+        descriptor: BluetoothGattDescriptor,
+        status: Int,
+        value: ByteArray,
+    ) {
+        val future: ReadDescriptorResultFuture?
+        synchronized(readDescriptorResultFutureList) {
+            future = readDescriptorResultFutureList.firstOrNull {
+                it.deviceId == gatt.device.address &&
+                    it.descriptorId == descriptor.uuid.toString() &&
+                    it.characteristicId == descriptor.characteristic.uuid.toString() &&
+                    it.serviceId == descriptor.characteristic.service.uuid.toString()
+            }
+            future?.let { readDescriptorResultFutureList.remove(it) }
+        }
+        if (future != null) {
+            postToMainLooper {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    future.result(Result.success(value))
+                } else {
+                    future.result(
+                        Result.failure(
+                            createFlutterError(
+                                gattStatusToBleShieldNativeErrorCode(status),
+                                "Failed to read descriptor",
+                                status.toString()
+                            )
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onDescriptorRead(
+        gatt: BluetoothGatt,
+        descriptor: BluetoothGattDescriptor,
+        status: Int,
+    ) {
+        onDescriptorRead(gatt, descriptor, status, descriptor.value ?: byteArrayOf())
+    }
+
+    override fun writeDescriptorValue(
+        deviceId: String,
+        service: String,
+        characteristic: String,
+        descriptor: String,
+        value: ByteArray,
+        callback: (Result<Unit>) -> Unit,
+    ) {
+        try {
+            BleShieldNativeLogger.logDebug("WRITE_DESCRIPTOR -> $deviceId $service $characteristic $descriptor len=${value.size}")
+            val gatt = gattRegistry.get(deviceId)
+            val gattCharacteristic = gatt.getCharacteristic(service, characteristic)
+            if (gattCharacteristic == null) {
+                callback(
+                    Result.failure(
+                        createFlutterError(
+                            BleShieldNativeErrorCode.CHARACTERISTIC_NOT_FOUND,
+                            "Characteristic not found"
+                        )
+                    )
+                )
+                return
+            }
+            val gattDescriptor = gattCharacteristic.getDescriptor(UUID.fromString(descriptor))
+            if (gattDescriptor == null) {
+                callback(
+                    Result.failure(
+                        createFlutterError(
+                            BleShieldNativeErrorCode.CHARACTERISTIC_NOT_FOUND,
+                            "Descriptor not found"
+                        )
+                    )
+                )
+                return
+            }
+
+            val writeFuture = WriteDescriptorResultFuture(
+                gatt.device.address,
+                gattDescriptor.uuid.toString(),
+                gattCharacteristic.uuid.toString(),
+                gattCharacteristic.service.uuid.toString(),
+                callback
+            )
+
+            synchronized(writeDescriptorResultFutureList) {
+                writeDescriptorResultFutureList.add(writeFuture)
+            }
+
+            val status = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                gatt.writeDescriptor(gattDescriptor, value)
+            } else {
+                @Suppress("DEPRECATION")
+                gattDescriptor.value = value
+                @Suppress("DEPRECATION")
+                if (gatt.writeDescriptor(gattDescriptor)) BluetoothGatt.GATT_SUCCESS else BluetoothGatt.GATT_FAILURE
+            }
+
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                synchronized(writeDescriptorResultFutureList) {
+                    writeDescriptorResultFutureList.remove(writeFuture)
+                }
+                callback(
+                    Result.failure(
+                        createFlutterError(
+                            gattStatusToBleShieldNativeErrorCode(status),
+                            "Failed to write descriptor",
+                            status.toString()
+                        )
+                    )
+                )
+            }
+        } catch (e: FlutterError) {
+            callback(Result.failure(e))
+        } catch (e: Exception) {
+            callback(
+                Result.failure(
+                    createFlutterError(
+                        BleShieldNativeErrorCode.FAILED,
+                        "Failed to write descriptor value",
+                        e.toString()
+                    )
+                )
+            )
+        }
+    }
+
+    override fun requestMtu(deviceId: String, expectedMtu: Long, callback: (Result<Long>) -> Unit) {
+        BleShieldNativeLogger.logDebug("REQUEST_MTU -> $deviceId expected=$expectedMtu")
+        val gatt = try {
+            gattRegistry.get(deviceId)
+        } catch (e: FlutterError) {
+            postMtuResult(callback, Result.failure(e))
+            return
+        }
+        var reusedMtu: Int? = null
+        var shouldRequest = false
+        synchronized(mtuResultFutureList) {
+            val cached = negotiatedMtus[gatt]
+            // Android 14+ ignores subsequent negotiations. Earlier versions
+            // can still request an increase when the observed MTU is smaller.
+            if (cached != null && canReuseNegotiatedMtu(cached, expectedMtu.toInt(), Build.VERSION.SDK_INT)) {
+                reusedMtu = cached
+            } else {
+                val alreadyPending = mtuResultFutureList.any { it.gatt === gatt }
+                // Register before requestMtu: its callback can arrive immediately.
+                mtuResultFutureList.add(MtuResultFuture(deviceId, gatt, callback))
+                shouldRequest = !alreadyPending
+            }
+        }
+        reusedMtu?.let {
+            // Deliver outside the lock, like every other completion path.
+            postMtuResult(callback, Result.success(it.toLong()))
+            return
+        }
+        if (!shouldRequest) return
+        try {
+            if (!gatt.requestMtu(expectedMtu.toInt())) {
+                completeMtu(gatt, Result.failure(createFlutterError(
+                    BleShieldNativeErrorCode.FAILED,
+                    "MTU request was not accepted",
+                )))
+            }
+        } catch (e: Exception) {
+            completeMtu(gatt, Result.failure(
+                if (e is FlutterError) e else createFlutterError(
+                    BleShieldNativeErrorCode.FAILED,
+                    "Failed to request MTU",
+                    e.toString(),
+                )
+            ))
+        }
+    }
+
+    private fun postMtuResult(callback: (Result<Long>) -> Unit, result: Result<Long>) {
+        postToMainLooper {
+            try {
+                callback(result)
+            } catch (e: Exception) {
+                BleShieldNativeLogger.logError("MTU completion delivery failed: $e")
+            }
+        }
+    }
+
+    private fun completeMtu(gatt: BluetoothGatt, result: Result<Long>) {
+        val pending: List<MtuResultFuture>
+        synchronized(mtuResultFutureList) {
+            result.getOrNull()?.let { negotiatedMtus[gatt] = it.toInt() }
+            pending = mtuResultFutureList.filter { it.gatt === gatt }
+            mtuResultFutureList.removeAll(pending)
+        }
+        // GATT callbacks run on Binder threads. Match the main-looper delivery
+        // used by other BLE completions, after removing requests under the lock.
+        for (future in pending) postMtuResult(future.result, result)
+    }
+
+    override fun requestConnectionPriority(
+        deviceId: String,
+        priority: BleConnectionPriority,
+        callback: (Result<Unit>) -> Unit,
+    ) {
+        try {
+            val gatt = gattRegistry.get(deviceId)
+            val androidPriority = when (priority) {
+                BleConnectionPriority.BALANCED -> BluetoothGatt.CONNECTION_PRIORITY_BALANCED
+                BleConnectionPriority.HIGH_PERFORMANCE -> BluetoothGatt.CONNECTION_PRIORITY_HIGH
+                BleConnectionPriority.LOW_POWER -> BluetoothGatt.CONNECTION_PRIORITY_LOW_POWER
+            }
+            val success = gatt.requestConnectionPriority(androidPriority)
+            if (success) {
+                callback(Result.success(Unit))
+            } else {
+                callback(
+                    Result.failure(
+                        createFlutterError(
+                            BleShieldNativeErrorCode.FAILED,
+                            "requestConnectionPriority returned false",
+                        ),
+                    ),
+                )
+            }
+        } catch (e: FlutterError) {
+            callback(Result.failure(e))
+        } catch (e: Exception) {
+            callback(
+                Result.failure(
+                    createFlutterError(
+                        BleShieldNativeErrorCode.FAILED,
+                        "requestConnectionPriority failed",
+                        e.toString()
+                    )
+                )
+            )
+        }
+    }
+
+    // BluetoothGattCallback.onConnectionUpdated is @hide (not in public android.jar).
+    // Same method name is required so the framework invokes it at runtime; no `override`.
+    @Suppress("unused")
+    fun onConnectionUpdated(
+        gatt: BluetoothGatt?,
+        interval: Int,
+        latency: Int,
+        timeout: Int,
+        status: Int,
+    ) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val deviceId = gatt?.device?.address ?: return
+        if (!gattRegistry.isKnown(deviceId)) return
+        BleShieldNativeLogger.logDebug(
+            "onConnectionUpdated -> $deviceId interval=$interval latency=$latency timeout=$timeout status=$status"
+        )
+        mainThreadHandler?.post {
+            callbackChannel?.onConnectionParametersUpdated(
+                BleConnectionParametersChange(
+                    deviceId = deviceId,
+                    interval = interval.toLong(),
+                    latency = latency.toLong(),
+                    supervisionTimeout = timeout.toLong(),
+                    status = status.toLong(),
+                )
+            ) {}
+        }
+    }
+
+    override fun onMtuChanged(gatt: BluetoothGatt?, mtu: Int, status: Int) {
+        val deviceId = gatt?.device?.address ?: return
+        if (closingGatts.contains(gatt)) return
+        val current = gattRegistry.find(deviceId)
+        // Only the registered client may report or cache an MTU; a stale client
+        // that was already removed must not populate state for a new connection.
+        if (current !== gatt) return
+        BleShieldNativeLogger.logDebug("MTU_CHANGED <- $deviceId mtu=$mtu status=$status")
+        completeMtu(gatt, if (status == BluetoothGatt.GATT_SUCCESS) {
+            Result.success(mtu.toLong())
+        } else {
+            Result.failure(createFlutterError(
+                BleShieldNativeErrorCode.FAILED,
+                "Failed to change MTU",
+                status.toString(),
+            ))
+        })
+    }
+
+    override fun isPaired(deviceId: String, callback: (Result<Boolean>) -> Unit) {
+        val remoteDevice: BluetoothDevice =
+            bluetoothManager.adapter.getRemoteDevice(deviceId)
+        callback(Result.success(remoteDevice.isBonded()))
+    }
+
+    override fun pair(deviceId: String, callback: (Result<Boolean>) -> Unit) {
+        try {
+            val remoteDevice = bluetoothManager.adapter.getRemoteDevice(deviceId)
+            val pendingFuture = pairResultFutures.remove(deviceId)
+
+            // If already paired, return and complete pending futures
+            if (remoteDevice.isBonded()) {
+                pendingFuture?.let { it(Result.success(true)) }
+                callback(Result.success(true))
+                return
+            }
+
+            // throw error if we already have a pending future
+            if (pendingFuture != null) {
+                callback(
+                    Result.failure(
+                        createFlutterError(
+                            BleShieldNativeErrorCode.OPERATION_IN_PROGRESS,
+                            "Pairing already in progress"
+                        )
+                    )
+                )
+                return
+            }
+
+            // Make a Pair request and complete future from Pair Update intent
+            if (remoteDevice.createBond()) {
+                pairResultFutures[deviceId] = callback
+            } else {
+                callback(
+                    Result.failure(
+                        createFlutterError(
+                            BleShieldNativeErrorCode.PAIRING_FAILED,
+                            "Failed to pair"
+                        )
+                    )
+                )
+            }
+        } catch (e: Exception) {
+            callback(
+                Result.failure(
+                    createFlutterError(BleShieldNativeErrorCode.FAILED, e.toString())
+                )
+            )
+        }
+
+    }
+
+    override fun unPair(deviceId: String, callback: (Result<Unit>) -> Unit) {
+        try {
+            val remoteDevice: BluetoothDevice =
+                bluetoothManager.adapter.getRemoteDevice(deviceId)
+            if (remoteDevice.isBonded()) remoteDevice.removeBond()
+            callback(Result.success(Unit))
+        } catch (e: Exception) {
+            callback(Result.failure(e))
+        }
+    }
+
+    override fun getSystemDevices(
+        withServices: List<String>,
+        callback: (Result<List<BleShieldNativeScanResult>>) -> Unit,
+    ) {
+        var devices: List<BluetoothDevice> =
+            bluetoothManager.getConnectedDevices(BluetoothProfile.GATT)
+        if (withServices.isNotEmpty()) {
+            devices = filterDevicesByServices(devices, withServices)
+        }
+        callback(
+            Result.success(
+                devices.map {
+                    val timestampMicroseconds = System.currentTimeMillis() * 1000
+                    BleShieldNativeScanResult(
+                        name = it.name,
+                        deviceId = it.address,
+                        isPaired = it.isBonded(),
+                        manufacturerDataList = null,
+                        serviceData = null,
+                        rssi = null,
+                        timestamp = timestampMicroseconds / 1000,
+                        timestampMicroseconds = timestampMicroseconds
+                    )
+                }
+            )
+        )
+    }
+
+    private fun filterDevicesByServices(
+        devices: List<BluetoothDevice>,
+        withServices: List<String>,
+    ): List<BluetoothDevice> {
+        // If all devices have cached services
+        if (devices.all { cachedServicesMap[it.address] != null }) {
+            return devices.filter { device ->
+                cachedServicesMap[device.address]?.any { uuid -> withServices.contains(uuid) } == true
+            }
+        }
+
+        // Else discover services off already connected devices
+        val latch = CountDownLatch(devices.size)
+        val resultMap = mutableMapOf<String, Boolean>()
+
+        devices.forEach { device ->
+            discoverServicesOffAlreadyConnectedDevice(device) { uuids ->
+                resultMap[device.address] =
+                    uuids?.any { uuid -> withServices.contains(uuid) } == true
+                latch.countDown()
+            }
+        }
+
+        try {
+            val timeout = (devices.size * 2).toLong()
+            latch.await(timeout, TimeUnit.SECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+
+        return devices.filter { resultMap[it.address] == true }
+    }
+
+    private fun discoverServicesOffAlreadyConnectedDevice(
+        device: BluetoothDevice,
+        callback: (List<String>?) -> Unit,
+    ) {
+        // Check if already cached
+        cachedServicesMap[device.address]?.let {
+            callback(it)
+            return
+        }
+
+        // To avoid duplicate callback
+        var isUpdated = false
+        fun updateCallback(uuids: List<String>?) {
+            if (isUpdated) return
+            callback(uuids)
+            isUpdated = true
+        }
+
+        // If its a known gatt, just discover services
+        gattRegistry.find(device.address)?.let { gatt ->
+            gatt.services?.let { services ->
+                updateCallback(services.map { service -> service.uuid.toString() })
+                return
+            }
+
+            if (gatt.discoverServices()) {
+                // Completed by onServicesDiscovered on a binder thread.
+                synchronized(discoverServicesFutureList) {
+                    discoverServicesFutureList.add(
+                        DiscoverServicesFuture(
+                            device.address,
+                            false
+                        ) { uuids: Result<List<BleShieldNativeService>> ->
+                            if (uuids.isSuccess) {
+                                updateCallback(uuids.getOrNull()?.map { it.uuid })
+                            } else {
+                                updateCallback(null)
+                            }
+                        }
+                    )
+                }
+                return
+            }
+        }
+
+        // Else connect to Gatt, discover services, then disconnect
+        val callbackHandler = object : BluetoothGattCallback() {
+            override fun onConnectionStateChange(gatt: BluetoothGatt?, status: Int, newState: Int) {
+                if (status == BluetoothGatt.GATT_SUCCESS && newState == BluetoothGatt.STATE_CONNECTED) {
+                    if (gatt?.discoverServices() != true) {
+                        updateCallback(null)
+                        releaseDiscoveryGatt(gatt)
+                    }
+                } else {
+                    updateCallback(null)
+                    // This client is never registered: release it on every non-connected state.
+                    releaseDiscoveryGatt(gatt)
+                }
+            }
+
+            override fun onServicesDiscovered(gatt: BluetoothGatt?, status: Int) {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    val uuids = gatt?.services?.map { it.uuid.toString() }
+                    if (uuids != null) {
+                        setCachedServices(device.address, uuids)
+                    }
+                    updateCallback(uuids)
+                }
+                releaseDiscoveryGatt(gatt)
+            }
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            device.connectGatt(context, false, callbackHandler, BluetoothDevice.TRANSPORT_LE)
+        } else {
+            device.connectGatt(context, false, callbackHandler)
+        }
+    }
+
+    /**
+     * Releases a discovery-only client from [discoverServicesOffAlreadyConnectedDevice]. It is
+     * never put in the registry, so nothing else would ever close it.
+     */
+    private fun releaseDiscoveryGatt(gatt: BluetoothGatt?) {
+        if (gatt == null || gattRegistry.find(gatt.device.address) === gatt) return
+        gatt.disconnect()
+        gatt.close()
+    }
+
+    /**
+     * Fails pending operations for [deviceId]. When [gatt] is provided (a
+     * disconnect of a specific client), only that client's MTU state is
+     * evicted so a newer client for the same address keeps its negotiation.
+     */
+    private fun cleanUpConnection(deviceId: String, gatt: BluetoothGatt? = null) {
+        val deviceDisconnectedError: FlutterError = createFlutterError(
+            BleShieldNativeErrorCode.DEVICE_DISCONNECTED,
+            "Device Disconnected",
+        )
+        val pendingReads: List<ReadResultFuture>
+        synchronized(readResultFutureList) {
+            pendingReads = readResultFutureList.filter { it.deviceId == deviceId }
+            readResultFutureList.removeAll(pendingReads)
+        }
+        for (future in pendingReads) {
+            postToMainLooper {
+                try {
+                    future.result(Result.failure(deviceDisconnectedError))
+                } catch (e: Exception) {
+                    BleShieldNativeLogger.logError("Read completion delivery failed: $e")
+                }
+            }
+        }
+        val pendingWrites: List<WriteResultFuture>
+        synchronized(writeResultFutureList) {
+            pendingWrites = writeResultFutureList.filter { it.deviceId == deviceId }
+            writeResultFutureList.removeAll(pendingWrites)
+        }
+        for (future in pendingWrites) {
+            postToMainLooper {
+                try {
+                    future.result(Result.failure(deviceDisconnectedError))
+                } catch (e: Exception) {
+                    BleShieldNativeLogger.logError("Write completion delivery failed: $e")
+                }
+            }
+        }
+        val pendingDescriptorReads: List<ReadDescriptorResultFuture>
+        synchronized(readDescriptorResultFutureList) {
+            pendingDescriptorReads = readDescriptorResultFutureList.filter { it.deviceId == deviceId }
+            readDescriptorResultFutureList.removeAll(pendingDescriptorReads)
+        }
+        for (future in pendingDescriptorReads) {
+            postToMainLooper {
+                try {
+                    future.result(Result.failure(deviceDisconnectedError))
+                } catch (e: Exception) {
+                    BleShieldNativeLogger.logError("Read descriptor completion delivery failed: $e")
+                }
+            }
+        }
+        val pendingDescriptorWrites: List<WriteDescriptorResultFuture>
+        synchronized(writeDescriptorResultFutureList) {
+            pendingDescriptorWrites = writeDescriptorResultFutureList.filter { it.deviceId == deviceId }
+            writeDescriptorResultFutureList.removeAll(pendingDescriptorWrites)
+        }
+        for (future in pendingDescriptorWrites) {
+            postToMainLooper {
+                try {
+                    future.result(Result.failure(deviceDisconnectedError))
+                } catch (e: Exception) {
+                    BleShieldNativeLogger.logError("Write descriptor completion delivery failed: $e")
+                }
+            }
+        }
+        val pendingSubscriptions: List<SubscriptionResultFuture>
+        synchronized(subscriptionResultFutureList) {
+            pendingSubscriptions = subscriptionResultFutureList.filter { it.deviceId == deviceId }
+            subscriptionResultFutureList.removeAll(pendingSubscriptions)
+        }
+        for (future in pendingSubscriptions) {
+            postToMainLooper {
+                try {
+                    future.result(Result.failure(deviceDisconnectedError))
+                } catch (e: Exception) {
+                    BleShieldNativeLogger.logError("Subscription completion delivery failed: $e")
+                }
+            }
+        }
+        val pendingMtus: List<MtuResultFuture>
+        synchronized(mtuResultFutureList) {
+            pendingMtus = mtuResultFutureList.filter {
+                if (gatt != null) it.gatt === gatt else it.deviceId == deviceId
+            }
+            mtuResultFutureList.removeAll(pendingMtus)
+            if (gatt != null) {
+                negotiatedMtus.remove(gatt)
+            } else {
+                negotiatedMtus.keys.removeAll { it.device.address == deviceId }
+            }
+        }
+        for (future in pendingMtus) {
+            postMtuResult(future.result, Result.failure(deviceDisconnectedError))
+        }
+        val pendingDiscoveries: List<DiscoverServicesFuture>
+        synchronized(discoverServicesFutureList) {
+            pendingDiscoveries = discoverServicesFutureList.filter { it.deviceId == deviceId }
+            discoverServicesFutureList.removeAll(pendingDiscoveries)
+        }
+        for (future in pendingDiscoveries) {
+            postToMainLooper {
+                try {
+                    future.result(Result.failure(deviceDisconnectedError))
+                } catch (e: Exception) {
+                    BleShieldNativeLogger.logError(
+                        "Discover services completion delivery failed: $e"
+                    )
+                }
+            }
+        }
+        val pendingRssis: List<RssiResultFuture>
+        synchronized(rssiResultFutureList) {
+            pendingRssis = rssiResultFutureList.filter { it.deviceId == deviceId }
+            rssiResultFutureList.removeAll(pendingRssis)
+        }
+        for (future in pendingRssis) {
+            postToMainLooper {
+                try {
+                    future.result(Result.failure(deviceDisconnectedError))
+                } catch (e: Exception) {
+                    BleShieldNativeLogger.logError("RSSI completion delivery failed: $e")
+                }
+            }
+        }
+    }
+
+    private fun cleanConnection(gatt: BluetoothGatt) {
+        val deviceId = gatt.device.address
+        gattRegistry.remove(gatt)
+        cleanUpConnection(deviceId, gatt)
+        closingGatts.add(gatt)
+        gatt.disconnect()
+        // close() runs from onConnectionStateChange once the link is down. A client that never
+        // reached CONNECTED gets no callback at all, so release it anyway after a while (#277).
+        mainThreadHandler?.postDelayed({
+            if (closingGatts.remove(gatt)) {
+                BleShieldNativeLogger.logDebug("No STATE_DISCONNECTED for $deviceId, closing gatt")
+                gatt.close()
+                // A newer connect() owns this address now; its state is not ours to report.
+                if (!gattRegistry.isKnown(deviceId)) {
+                    callbackChannel?.onConnectionChanged(deviceId, false, null, null, null) {}
+                }
+            }
+        }, gattCloseTimeoutMs)
+    }
+
+    private fun onBondStateUpdate(deviceId: String, bonded: Boolean, isFailure: Boolean = false) {
+        val future = pairResultFutures.remove(deviceId)
+        future?.let { it(Result.success(bonded)) }
+        mainThreadHandler?.post {
+            callbackChannel?.onPairStateChange(deviceId, bonded, isFailure) {}
+        }
+    }
+
+    private val broadcastReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == BluetoothAdapter.ACTION_STATE_CHANGED) {
+                mainThreadHandler?.post {
+                    callbackChannel?.onAvailabilityChanged(
+                        bluetoothManager.adapter?.state?.toAvailabilityState()
+                            ?: AvailabilityState.UNKNOWN
+                    ) {}
+                }
+            } else if (intent.action == BluetoothDevice.ACTION_BOND_STATE_CHANGED) {
+                val bondStateChange = intent.getBondStateChange()
+                if (bondStateChange == null) {
+                    BleShieldNativeLogger.logError("No device found in ACTION_BOND_STATE_CHANGED intent")
+                    return
+                }
+                // get pairing failed error
+                when (bondStateChange.state) {
+                    BluetoothDevice.BOND_BONDING -> {
+                        bondingAttempts.add(bondStateChange.device.address)
+                        BleShieldNativeLogger.logVerbose("${bondStateChange.device.address} BOND_BONDING")
+                    }
+
+                    BluetoothDevice.BOND_BONDED -> {
+                        bondingAttempts.remove(bondStateChange.device.address)
+                        onBondStateUpdate(bondStateChange.device.address, true)
+                    }
+
+                    BluetoothDevice.ERROR -> {
+                        bondingAttempts.remove(bondStateChange.device.address)
+                        onBondStateUpdate(bondStateChange.device.address, false, isFailure = true)
+                    }
+
+                    BluetoothDevice.BOND_NONE -> {
+                        BleShieldNativeLogger.logError("${bondStateChange.device.address} BOND_NONE")
+                        // A BOND_NONE that ends a bonding attempt we saw start is a failed/declined bond,
+                        // not a steady BOND_NONE; report it as a failure so it isn't deduped away.
+                        val failed = bondingAttempts.remove(bondStateChange.device.address)
+                        onBondStateUpdate(bondStateChange.device.address, false, isFailure = failed)
+                    }
+                }
+            }
+        }
+    }
+
+
+    private val scanCallback = object : ScanCallback() {
+        override fun onScanFailed(errorCode: Int) {
+            BleShieldNativeLogger.logError("OnScanFailed: ${errorCode.parseScanErrorMessage()}")
+            // SafeScanner's own throttle reports SCANNING_TOO_FREQUENTLY and retries by itself:
+            // the scan will run, so it is not a failure for Dart.
+            if (errorCode == ScanCallback.SCAN_FAILED_SCANNING_TOO_FREQUENTLY && safeScanner.isRetryPending()) return
+            mainThreadHandler?.post {
+                callbackChannel?.onScanFailed(errorCode.toLong()) {}
+            }
+        }
+
+        override fun onScanResult(callbackType: Int, result: ScanResult) {
+
+            // BleShieldNativeLogger.logVerbose("onScanResult: $result")
+            var serviceUuids: Array<UUID> = arrayOf()
+            result.device.uuids?.forEach {
+                serviceUuids += it.uuid
+            }
+            result.scanRecord?.serviceUuids?.forEach {
+                if (!serviceUuids.contains(it.uuid)) {
+                    serviceUuids += it.uuid
+                }
+            }
+
+            val name = result.resolvedDeviceName
+            val manufacturerDataList = result.manufacturerDataList
+            val serviceData = result.serviceData
+            // ScanResult.timestampNanos is captured by Android at packet
+            // reception. Convert that monotonic value to epoch microseconds
+            // before posting to Flutter so main-thread delay is excluded.
+            val timestampMicroseconds = System.currentTimeMillis() * 1000 -
+                (SystemClock.elapsedRealtimeNanos() - result.timestampNanos) / 1000
+
+            if (!bleShieldNativeFilterUtil.filterDevice(
+                    name,
+                    manufacturerDataList,
+                    serviceUuids,
+                    result.serviceDataUuids
+                )
+            ) return
+
+
+            mainThreadHandler?.post {
+                callbackChannel?.onScanResult(
+                    BleShieldNativeScanResult(
+                        name = name,
+                        deviceId = result.device.address,
+                        isPaired = result.device.isBonded(),
+                        manufacturerDataList = manufacturerDataList,
+                        serviceData = serviceData,
+                        rssi = result.rssi.toLong(),
+                        services = serviceUuids.map { it.toString() }.toList(),
+                        timestamp = timestampMicroseconds / 1000,
+                        timestampMicroseconds = timestampMicroseconds,
+                        connectable = result.isConnectable
+                    )
+                ) {}
+            }
+        }
+
+        override fun onBatchScanResults(results: MutableList<ScanResult>?) {
+            BleShieldNativeLogger.logVerbose("onBatchScanResults: $results")
+        }
+    }
+
+
+    override fun onConnectionStateChange(
+        gatt: BluetoothGatt,
+        status: Int,
+        newState: Int,
+    ) {
+        BleShieldNativeLogger.logDebug(
+            "onConnectionStateChange-> Status: $status ${status.parseHciErrorCode()}, NewState: $newState"
+        )
+
+        // A client connect() already released for a newer one (one client per device). close()
+        // normally silences it, but a late event must not report state or fail operations that
+        // belong to the registered client.
+        val registered = gattRegistry.find(gatt.device.address)
+        if (registered != null && registered !== gatt && !closingGatts.contains(gatt)) {
+            BleShieldNativeLogger.logDebug("Ignoring state $newState of a replaced gatt for ${gatt.device.address}")
+            return
+        }
+
+        if (newState == BluetoothGatt.STATE_CONNECTED) {
+            connectedGatts.add(gatt)
+            mainThreadHandler?.post {
+                callbackChannel?.onConnectionChanged(
+                    gatt.device.address, true, status.parseHciErrorCode(), status.toConnectionErrorCode(), status.toGattErrorCode()
+                ) {}
+            }
+        } else if (newState == BluetoothGatt.STATE_DISCONNECTED) {
+            val deviceId = gatt.device.address
+            val wasConnected = connectedGatts.remove(gatt)
+            val shouldAutoConnect = autoConnectDevices.contains(deviceId)
+            val closingByRequest = closingGatts.remove(gatt)
+            // disconnect() already dropped this client from the cache, so a known gatt is a newer
+            // connect() whose pending operations and connection state must be left alone.
+            val superseded = closingByRequest && gattRegistry.isKnown(deviceId)
+
+            if (!superseded) {
+                // Always clean up internal state (futures, etc.)
+                cleanUpConnection(deviceId, gatt)
+
+                // Send connection changed callback
+                mainThreadHandler?.post {
+                    callbackChannel?.onConnectionChanged(
+                        deviceId,
+                        false,
+                        status.parseHciErrorCode(),
+                        status.toConnectionErrorCode(wasConnected),
+                        status.toGattErrorCode(),
+                    ) {}
+                }
+            }
+
+            if (closingByRequest || !shouldAutoConnect) {
+                // Only keep the client open when autoConnect should let Android reconnect it
+                gattRegistry.remove(gatt)
+                gatt.disconnect()
+                BleShieldNativeLogger.logDebug("Closing gatt for $deviceId")
+                gatt.close()
+            }
+            // When autoConnect is enabled, keep GATT open for Android to reconnect
+        }
+    }
+
+    override fun onCharacteristicChanged(
+        gatt: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic,
+        value: ByteArray,
+    ) {
+        BleShieldNativeLogger.logVerbose(
+            "NOTIFY <- ${gatt.device.address} ${characteristic.uuid} len=${value.size}"
+        )
+        mainThreadHandler?.post {
+            callbackChannel?.onValueChanged(
+                deviceIdArg = gatt.device.address,
+                characteristicIdArg = characteristic.uuid.toString(),
+                valueArg = value,
+                timestampArg = System.currentTimeMillis()
+            ) {}
+        }
+    }
+
+    override fun onDescriptorWrite(
+        gatt: BluetoothGatt?,
+        descriptor: BluetoothGattDescriptor?,
+        status: Int,
+    ) {
+        // No super call: BluetoothGattCallback's default implementations are
+        // empty, and calling one from a unit test needs
+        // testOptions.unitTests.returnDefaultValues, which would also make
+        // every other unstubbed android.jar call in the suite fail silently.
+        if (descriptor != null) {
+            val future: WriteDescriptorResultFuture?
+            synchronized(writeDescriptorResultFutureList) {
+                future = writeDescriptorResultFutureList.firstOrNull {
+                    it.deviceId == gatt?.device?.address &&
+                        it.descriptorId == descriptor.uuid.toString() &&
+                        it.characteristicId == descriptor.characteristic?.uuid?.toString() &&
+                        it.serviceId == descriptor.characteristic?.service?.uuid?.toString()
+                }
+                future?.let { writeDescriptorResultFutureList.remove(it) }
+            }
+            if (future != null) {
+                postToMainLooper {
+                    if (status == BluetoothGatt.GATT_SUCCESS) {
+                        future.result(Result.success(Unit))
+                    } else {
+                        future.result(
+                            Result.failure(
+                                createFlutterError(
+                                    gattStatusToBleShieldNativeErrorCode(status),
+                                    "Failed to write descriptor",
+                                    status.toString()
+                                )
+                            )
+                        )
+                    }
+                }
+            }
+        }
+
+        if (descriptor?.uuid.toString() == ccdCharacteristic.toString()) {
+            val char: String? = descriptor?.characteristic?.uuid?.toString()
+            val service: String? = descriptor?.characteristic?.service?.uuid?.toString()
+            val deviceId: String? = gatt?.device?.address
+            if (deviceId != null && char != null && service != null) {
+                updateSubscriptionState(deviceId, char, service, status)
+            }
+        }
+    }
+
+    private fun updateSubscriptionState(
+        deviceId: String,
+        characteristic: String,
+        service: String,
+        status: Int,
+    ) {
+        // Runs on a binder thread (the CCCD write callback): match and remove
+        // under the lock, then complete on the main thread, where
+        // platform-channel replies must be sent.
+        val future: SubscriptionResultFuture?
+        synchronized(subscriptionResultFutureList) {
+            future = subscriptionResultFutureList.firstOrNull {
+                it.deviceId == deviceId &&
+                    it.characteristicId == characteristic &&
+                    it.serviceId == service
+            }
+            future?.let { subscriptionResultFutureList.remove(it) }
+        }
+        if (future == null) {
+            return
+        }
+        postToMainLooper {
+            try {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    future.result(Result.success(Unit))
+                } else {
+                    future.result(
+                        Result.failure(
+                            createFlutterError(
+                                gattStatusToBleShieldNativeErrorCode(status),
+                                "Failed to update subscription state",
+                                status.toString()
+                            )
+                        )
+                    )
+                }
+            } catch (e: Exception) {
+                BleShieldNativeLogger.logError(
+                    "Subscription completion delivery failed: $e"
+                )
+            }
+        }
+    }
+
+    private fun isBluetoothAvailable(): Boolean {
+        return bluetoothManager.isBluetoothEnabled()
+    }
+
+    /// Whether the controller can perform offloaded first-match (on-found)
+    /// filtering. Android rejects `CALLBACK_TYPE_FIRST_MATCH` with
+    /// `SCAN_FAILED_FEATURE_UNSUPPORTED` unless offloaded filtering is supported
+    /// (`BluetoothLeScanner.isSettingsConfigAllowedForScan`). The framework also
+    /// checks available hardware tracking filters there, but that check uses a
+    /// hidden API, so the Dart layer stays the cross-platform guarantee.
+    private fun supportsFirstMatchScan(): Boolean {
+        val adapter = bluetoothManager.adapter ?: return false
+        return adapter.isOffloadedFilteringSupported
+    }
+
+    private fun setCachedServices(deviceId: String, services: List<String>) {
+        val cachedServicesSharedPref = context.getSharedPreferences(
+            "io.github.tganzerli.ble_shield.services",
+            Context.MODE_PRIVATE
+        )
+        cachedServicesSharedPref.edit { putStringSet(deviceId, services.toSet()) }
+        cachedServicesMap[deviceId] = services
+    }
+
+    private fun getCachedServicesMap(): Map<String, List<String>> {
+        val cachedServicesSharedPref = context.getSharedPreferences(
+            "io.github.tganzerli.ble_shield.services",
+            Context.MODE_PRIVATE
+        )
+        return cachedServicesSharedPref.all.mapValues { (_, value) ->
+            (value as? Set<*>)?.map { it.toString() } ?: emptyList()
+        }
+    }
+
+    /// Depreciated Members, ( Requires to support older android devices )
+    @Suppress("OVERRIDE_DEPRECATION", "DEPRECATION")
+    override fun onCharacteristicRead(
+        gatt: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic,
+        status: Int,
+    ) {
+        // characteristic.value is null on this legacy callback when the stack
+        // failed to unpack the response; passing it through aborted the read.
+        onCharacteristicRead(
+            gatt,
+            characteristic,
+            characteristic.value ?: byteArrayOf(),
+            status
+        )
+    }
+
+    @Suppress("OVERRIDE_DEPRECATION", "DEPRECATION")
+    override fun onCharacteristicChanged(
+        gatt: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic,
+    ) {
+        onCharacteristicChanged(
+            gatt,
+            characteristic,
+            characteristic.value ?: byteArrayOf()
+        )
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?): Boolean {
+        if (requestCode == bluetoothEnableRequestCode) {
+            val future = bluetoothEnableRequestFuture ?: return false
+            future(Result.success(resultCode == Activity.RESULT_OK))
+            bluetoothEnableRequestFuture = null
+            return true
+        } else if (requestCode == bluetoothDisableRequestCode) {
+            val future = bluetoothDisableRequestFuture ?: return false
+            future(Result.success(resultCode == Activity.RESULT_OK))
+            bluetoothDisableRequestFuture = null
+            return true
+        }
+        return false
+    }
+
+    override fun onAttachedToActivity(binding: ActivityPluginBinding) {
+        activity = binding.activity
+        binding.addActivityResultListener(this)
+        binding.addRequestPermissionsResultListener(this)
+        permissionHandler?.attachActivity(binding.activity)
+    }
+
+    override fun onDetachedFromActivity() {
+        activity = null
+        permissionHandler?.attachActivity(null)
+    }
+
+    override fun onDetachedFromActivityForConfigChanges() {
+        // Activity will be reattached, keep the reference
+    }
+
+    override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
+        activity = binding.activity
+        permissionHandler?.attachActivity(binding.activity)
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ): Boolean {
+        return permissionHandler?.handlePermissionResult(requestCode, permissions, grantResults)
+            ?: false
+    }
+}

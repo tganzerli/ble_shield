@@ -1,0 +1,324 @@
+import CoreBluetooth
+import Foundation
+
+#if os(iOS)
+    import Flutter
+#elseif os(OSX)
+    import FlutterMacOS
+#endif
+
+/// Handles asynchronous service discovery for a BLE peripheral.
+/// Manages the complete discovery flow: services -> characteristics -> descriptors
+class BleShieldNativeAsyncServiceDiscovery: NSObject {
+    private let peripheral: CBPeripheral
+    private let deviceId: String
+    private let completion: (Result<[BleShieldNativeService], Error>) -> Void
+    private var discoveredServicesProgressMap: [BleShieldNativeService] = []
+    private var discoveredDescriptorsSet: Set<String> = []
+    private var expectedCharacteristicsCountMap: [String: Int] = [:]
+    private var isDiscoveryInProgress = false
+    private var hasCompleted = false
+    private var withDescriptors: Bool
+    private var timeoutWorkItem: DispatchWorkItem?
+    private let timeoutSeconds: TimeInterval
+
+    /// Discovery that has not completed after the timeout fails, so that it cannot hold back
+    /// later calls for the same device.
+    static let defaultTimeoutSeconds: TimeInterval = 10.0
+
+    /// The discovery timeout for these options: `AppleDiscoverServicesOptions.timeoutMillis`,
+    /// else `defaultTimeoutSeconds`.
+    static func timeoutSeconds(for platformConfig: DiscoverServicesPlatformConfig?) -> TimeInterval {
+        guard let millis = platformConfig?.apple?.timeoutMillis, millis > 0 else {
+            return defaultTimeoutSeconds
+        }
+        return TimeInterval(millis) / 1000
+    }
+
+    init(peripheral: CBPeripheral, deviceId: String, withDescriptors: Bool, timeoutSeconds: TimeInterval = BleShieldNativeAsyncServiceDiscovery.defaultTimeoutSeconds, completion: @escaping (Result<[BleShieldNativeService], Error>) -> Void) {
+        self.peripheral = peripheral
+        self.deviceId = deviceId
+        self.completion = completion
+        self.withDescriptors = withDescriptors
+        self.timeoutSeconds = timeoutSeconds
+        super.init()
+    }
+
+    /// Starts the service discovery process
+    func startDiscovery() {
+        guard !isDiscoveryInProgress, !hasCompleted else {
+            BleShieldNativeLogger.shared.logWarning("Service discovery already in progress for device: \(deviceId)")
+            return
+        }
+        isDiscoveryInProgress = true
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self = self, !self.hasCompleted else { return }
+            BleShieldNativeLogger.shared.logError("Service discovery timed out for device: \(self.deviceId)")
+            self.completeWith(result: .failure(createFlutterError(code: .failed, message: "Service discovery timed out for device: \(self.deviceId)")))
+        }
+        self.timeoutWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + timeoutSeconds, execute: workItem)
+
+        // Check if services are already cached
+        let safeServices = peripheral.safeServices
+        if safeServices.hasForeign {
+            failForStaleGattCache(location: "cached services", foreignClassNames: safeServices.foreignClassNames)
+            return
+        }
+        if let cachedServices = safeServices.attributes, !cachedServices.isEmpty {
+            handleServicesDiscovered(cachedServices)
+        } else {
+            peripheral.discoverServices(nil)
+        }
+    }
+
+    /// Cancels the service discovery and fails completion
+    func cancel(error: Error) {
+        completeWith(result: .failure(error))
+    }
+
+    /// Fails discovery due to stale CoreBluetooth GATT cache holding foreign classes in attribute arrays
+    func failForStaleGattCache(location: String, foreignClassNames: [String]) {
+        let message = "Stale GATT cache: \(foreignClassNames.count) attribute(s) of unexpected type [\(foreignClassNames.joined(separator: ", "))] in \(location) of peripheral \(deviceId); iOS reads the device's attribute table again after Bluetooth is turned off and on or device is forgotten in Settings"
+        BleShieldNativeLogger.shared.logError(message)
+        completeWith(result: .failure(createFlutterError(code: .failed, message: message)))
+    }
+
+    /// Cleans up discovery state
+    func cleanup() {
+        isDiscoveryInProgress = false
+        timeoutWorkItem?.cancel()
+        timeoutWorkItem = nil
+        discoveredServicesProgressMap.removeAll()
+        discoveredDescriptorsSet.removeAll()
+        expectedCharacteristicsCountMap.removeAll()
+    }
+
+    private func completeWith(result: Result<[BleShieldNativeService], Error>) {
+        guard !hasCompleted else { return }
+        hasCompleted = true
+        cleanup()
+        completion(result)
+    }
+
+    private func handleServicesDiscovered(_ services: [CBService]) {
+        discoveredServicesProgressMap = services.map { BleShieldNativeService(uuid: $0.uuid.uuidString, characteristics: nil) }
+        discoveredDescriptorsSet = Set<String>()
+        expectedCharacteristicsCountMap = [:]
+
+        // If no services, complete discovery immediately
+        guard !services.isEmpty else {
+            checkForDiscoveryCompletion()
+            return
+        }
+
+        // Discover characteristics for each service
+        for service in services {
+            let safeChars = service.safeCharacteristics
+            if safeChars.hasForeign {
+                failForStaleGattCache(
+                    location: "cached characteristics of service \(service.uuid.uuidString)",
+                    foreignClassNames: safeChars.foreignClassNames
+                )
+                return
+            }
+            if let cachedChar = safeChars.attributes, !cachedChar.isEmpty {
+                // Characteristics already cached, process them
+                processCharacteristicsForService(service)
+            } else {
+                // Need to discover characteristics
+                peripheral.discoverCharacteristics(nil, for: service)
+            }
+        }
+    }
+
+    private func processCharacteristicsForService(_ service: CBService) {
+        let serviceUuid = service.uuid.uuidString
+        let safeChars = service.safeCharacteristics
+        if safeChars.hasForeign {
+            failForStaleGattCache(
+                location: "characteristics of service \(serviceUuid)",
+                foreignClassNames: safeChars.foreignClassNames
+            )
+            return
+        }
+        guard let characteristics = safeChars.attributes else {
+            // Service has no characteristics, mark as complete
+            expectedCharacteristicsCountMap[serviceUuid] = 0
+            if let index = discoveredServicesProgressMap.firstIndex(where: { $0.uuid == serviceUuid }) {
+                discoveredServicesProgressMap[index] = BleShieldNativeService(uuid: serviceUuid, characteristics: [])
+            }
+            checkForDiscoveryCompletion()
+            return
+        }
+
+        // Store expected characteristic count for this service
+        expectedCharacteristicsCountMap[serviceUuid] = characteristics.count
+
+        // If no characteristics, mark service as complete
+        if characteristics.isEmpty {
+            if let index = discoveredServicesProgressMap.firstIndex(where: { $0.uuid == serviceUuid }) {
+                discoveredServicesProgressMap[index] = BleShieldNativeService(uuid: serviceUuid, characteristics: [])
+            }
+            checkForDiscoveryCompletion()
+            return
+        }
+
+        if withDescriptors {
+            for characteristic in characteristics {
+                let safeDescs = characteristic.safeDescriptors
+                if safeDescs.hasForeign {
+                    failForStaleGattCache(
+                        location: "cached descriptors of characteristic \(characteristic.uuid.uuidString)",
+                        foreignClassNames: safeDescs.foreignClassNames
+                    )
+                    return
+                }
+                if let cachedDescriptors = safeDescs.attributes, !cachedDescriptors.isEmpty {
+                    handleDescriptorsDiscovered(for: characteristic)
+                } else {
+                    peripheral.discoverDescriptors(for: characteristic)
+                }
+            }
+        } else {
+            if let index = discoveredServicesProgressMap.firstIndex(where: { $0.uuid == serviceUuid }) {
+                discoveredServicesProgressMap[index] = BleShieldNativeService(
+                    uuid: serviceUuid,
+                    characteristics: characteristics.map {
+                        BleShieldNativeCharacteristic(
+                            uuid: $0.uuid.uuidString,
+                            properties: $0.properties.toCharacteristicProperty,
+                            descriptors: []
+                        )
+                    }
+                )
+            }
+            checkForDiscoveryCompletion()
+        }
+    }
+
+    private func handleDescriptorsDiscovered(for characteristic: CBCharacteristic) {
+        guard let service = characteristic.service else {
+            return
+        }
+
+        let serviceUuid = service.uuid.uuidString
+        let characteristicUuid = characteristic.uuid.uuidString
+        let characteristicKey = "\(serviceUuid):\(characteristicUuid)"
+
+        // Mark this characteristic's descriptors as discovered
+        discoveredDescriptorsSet.insert(characteristicKey)
+
+        // Get expected characteristic count for this service
+        guard let expectedCount = expectedCharacteristicsCountMap[serviceUuid] else {
+            return
+        }
+
+        // Check if all characteristics for this service have had their descriptors discovered
+        let safeChars = service.safeCharacteristics
+        if safeChars.hasForeign {
+            failForStaleGattCache(
+                location: "characteristics of service \(serviceUuid)",
+                foreignClassNames: safeChars.foreignClassNames
+            )
+            return
+        }
+        guard let allCharacteristics = safeChars.attributes else {
+            return
+        }
+
+        let discoveredCount = allCharacteristics.filter { char in
+            let key = "\(serviceUuid):\(char.uuid.uuidString)"
+            return discoveredDescriptorsSet.contains(key)
+        }.count
+
+        // Only update the service when all characteristics have descriptors discovered
+        if discoveredCount == expectedCount {
+            var bleShieldNativeCharacteristicsList: [BleShieldNativeCharacteristic] = []
+            for characteristic in allCharacteristics {
+                let safeDescs = characteristic.safeDescriptors
+                if safeDescs.hasForeign {
+                    failForStaleGattCache(
+                        location: "descriptors of characteristic \(characteristic.uuid.uuidString)",
+                        foreignClassNames: safeDescs.foreignClassNames
+                    )
+                    return
+                }
+                bleShieldNativeCharacteristicsList.append(
+                    BleShieldNativeCharacteristic(
+                        uuid: characteristic.uuid.uuidString,
+                        properties: characteristic.properties.toCharacteristicProperty,
+                        descriptors: (safeDescs.attributes ?? []).map { BleShieldNativeDescriptor(uuid: $0.uuid.uuidString) }
+                    )
+                )
+            }
+
+            if let index = discoveredServicesProgressMap.firstIndex(where: { $0.uuid == serviceUuid }) {
+                discoveredServicesProgressMap[index] = BleShieldNativeService(uuid: serviceUuid, characteristics: bleShieldNativeCharacteristicsList)
+            }
+
+            checkForDiscoveryCompletion()
+        }
+    }
+
+    private func checkForDiscoveryCompletion() {
+        // Check if all services have been fully discovered (all characteristics with all descriptors)
+        guard discoveredServicesProgressMap.allSatisfy({ $0.characteristics != nil }) else {
+            return
+        }
+        completeWith(result: .success(discoveredServicesProgressMap))
+    }
+}
+
+// These methods are called by the main plugin class when it receives delegate callbacks
+extension BleShieldNativeAsyncServiceDiscovery {
+    func handleDidDiscoverServices(_ peripheral: CBPeripheral, error: Error?) {
+        guard error == nil else {
+            completeWith(result: .failure(error!))
+            return
+        }
+        let safeServices = peripheral.safeServices
+        if safeServices.hasForeign {
+            failForStaleGattCache(location: "services", foreignClassNames: safeServices.foreignClassNames)
+            return
+        }
+        guard let services = safeServices.attributes else {
+            completeWith(result: .success([]))
+            return
+        }
+        handleServicesDiscovered(services)
+    }
+
+    func handleDidDiscoverCharacteristicsFor(_: CBPeripheral, service: CBService, error: Error?) {
+        guard (service as AnyObject) is CBService else {
+            let actual = NSStringFromClass(type(of: service as AnyObject))
+            failForStaleGattCache(
+                location: "didDiscoverCharacteristicsFor (delegate received \(actual))",
+                foreignClassNames: [actual]
+            )
+            return
+        }
+        guard error == nil else {
+            completeWith(result: .failure(error!))
+            return
+        }
+        processCharacteristicsForService(service)
+    }
+
+    func handleDidDiscoverDescriptorsFor(_: CBPeripheral, characteristic: CBCharacteristic, error: Error?) {
+        guard (characteristic as AnyObject) is CBCharacteristic else {
+            let actual = NSStringFromClass(type(of: characteristic as AnyObject))
+            failForStaleGattCache(
+                location: "didDiscoverDescriptorsFor (delegate received \(actual))",
+                foreignClassNames: [actual]
+            )
+            return
+        }
+        guard error == nil else {
+            completeWith(result: .failure(error!))
+            return
+        }
+        handleDescriptorsDiscovered(for: characteristic)
+    }
+}

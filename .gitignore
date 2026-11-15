@@ -1,0 +1,14 @@
+.dart_tool/
+build/
+pubspec.lock
+.flutter-plugins
+.flutter-plugins-dependencies
+.idea/
+*.iml
+.DS_Store
+coverage/
+example/ios/Pods/
+example/ios/.symlinks/
+example/ios/Flutter/ephemeral/
+example/android/.gradle/
+example/android/local.properties

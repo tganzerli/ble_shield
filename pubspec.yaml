@@ -1,0 +1,35 @@
+name: ble_shield
+description: >-
+  Defensive BLE central for Flutter (Android, iOS): cached state, aggregated
+  scan, serialized GATT, connect timeouts, managed auto-reconnect, typed errors.
+version: 0.2.0
+homepage: https://github.com/tganzerli/ble_shield
+repository: https://github.com/tganzerli/ble_shield
+issue_tracker: https://github.com/tganzerli/ble_shield/issues
+topics: [bluetooth, ble, bluetooth-low-energy, flutter-plugin]
+
+environment:
+  sdk: ^3.3.0
+  flutter: ">=3.19.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  meta: ^1.16.0
+  plugin_platform_interface: ^2.1.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+  pigeon: 29.0.12
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: io.github.tganzerli.ble_shield
+        pluginClass: BleShieldPlugin
+      ios:
+        pluginClass: BleShieldPlugin
+        sharedDarwinSource: true

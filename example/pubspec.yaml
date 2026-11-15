@@ -1,0 +1,25 @@
+name: ble_shield_example
+description: "Minimal ble_shield demo: scan, connect, notify, restoration."
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.3.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  ble_shield:
+    path: ../
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+  config:
+    # SwiftPM on, as in a real consumer app. The CocoaPods build is checked in a
+    # disposable copy created with this set to false (third_party/UPSTREAM.md).
+    enable-swift-package-manager: true

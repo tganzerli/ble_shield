@@ -3,6 +3,9 @@ import 'dart:async';
 import 'package:ble_shield/ble_shield.dart';
 import 'package:flutter/foundation.dart';
 // ble_shield's ConnectionState clashes with Flutter's AsyncSnapshot one.
+// Flutter 3.50 deprecates this library in favour of package:material_ui; the
+// example keeps it so it still builds on the package's minimum Flutter.
+// ignore: deprecated_member_use
 import 'package:flutter/material.dart' hide ConnectionState;
 
 /// Identifier this demo claims for iOS state restoration. Restoration is

@@ -2446,6 +2446,30 @@ class BleShieldNativeCallbackChannel(private val binaryMessenger: BinaryMessenge
       } 
     }
   }
+  /**
+   * The ATT MTU of a connection, sent whenever the platform reports it,
+   * requested or not: Android on every successful `onMtuChanged` (Android 14+
+   * negotiates on its own after connecting); Apple on connect, as
+   * `maximumWriteValueLength(.withoutResponse) + 3`, since it has no
+   * negotiation callback.
+   */
+  fun onMtuChanged(deviceIdArg: String, mtuArg: Long, callback: (Result<Unit>) -> Unit)
+{
+    val separatedMessageChannelSuffix = if (messageChannelSuffix.isNotEmpty()) ".$messageChannelSuffix" else ""
+    val channelName = "dev.flutter.pigeon.ble_shield.BleShieldNativeCallbackChannel.onMtuChanged$separatedMessageChannelSuffix"
+    val channel = BasicMessageChannel<Any?>(binaryMessenger, channelName, codec)
+    channel.send(listOf(deviceIdArg, mtuArg)) {
+      if (it is List<*>) {
+        if (it.size > 1) {
+          callback(Result.failure(FlutterError(it[0] as String, it[1] as String, it[2] as String?)))
+        } else {
+          callback(Result.success(Unit))
+        }
+      } else {
+        callback(Result.failure(BleShieldNativePigeonUtils.createConnectionError(channelName)))
+      } 
+    }
+  }
 }
 /**
  * Flutter -> Native (Apple central restoration only).

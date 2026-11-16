@@ -31,6 +31,40 @@ class ShieldDevice {
   /// Delivers the current state to every new subscriber, then changes.
   Stream<ConnectionState> get connectionState => _state.stream;
 
+  // ------------------------------------------------------------ diagnostics
+
+  final ValueStream<int?> _mtu = ValueStream<int?>(null);
+  final ValueStream<ShieldConnectionParameters?> _connectionParameters =
+      ValueStream<ShieldConnectionParameters?>(null);
+
+  /// ATT MTU of the current connection, as the platform reported it: Android
+  /// on every negotiation (Android 14+ negotiates on its own after
+  /// connecting), Apple on connect. `null` until the platform reports one,
+  /// and again after a disconnection. A link the OS already had may keep an
+  /// MTU that was never reported to this process.
+  int? get mtuNow => _mtu.value;
+
+  /// [mtuNow] to every new subscriber, then changes.
+  Stream<int?> get mtu => _mtu.stream;
+
+  /// Connection parameters of the current link, when the Android controller
+  /// reports them (API 26+, on each update). Always `null` on Apple and on
+  /// older Android; `null` again after a disconnection.
+  ShieldConnectionParameters? get connectionParametersNow =>
+      _connectionParameters.value;
+
+  /// [connectionParametersNow] to every new subscriber, then changes.
+  Stream<ShieldConnectionParameters?> get connectionParameters =>
+      _connectionParameters.stream;
+
+  void _setMtu(int mtu) {
+    if (!_disposed) _mtu.set(mtu);
+  }
+
+  void _setConnectionParameters(ShieldConnectionParameters parameters) {
+    if (!_disposed) _connectionParameters.set(parameters);
+  }
+
   /// A connect started by ble_shield is running or pending.
   bool get _initiatedByShield => _connecting || _attemptPending;
 
@@ -90,6 +124,8 @@ class ShieldDevice {
     _services = null;
     _discovering = null;
     _notifying.clear();
+    _mtu.set(null);
+    _connectionParameters.set(null);
   }
 
   /// Services of the current connection. The first call of every connection
@@ -515,6 +551,8 @@ class ShieldDevice {
     _disposed = true;
     _shield._devices.remove(remoteId);
     await _state.close();
+    await _mtu.close();
+    await _connectionParameters.close();
   }
 
   void _onDispose() {

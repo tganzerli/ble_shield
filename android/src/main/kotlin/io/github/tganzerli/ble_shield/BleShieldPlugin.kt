@@ -1259,6 +1259,12 @@ class BleShieldPlugin : BleShieldNativePlatformChannel, BluetoothGattCallback(),
             pending = mtuResultFutureList.filter { it.gatt === gatt }
             mtuResultFutureList.removeAll(pending)
         }
+        // Report every successful MTU, requested or not: Android 14+ negotiates
+        // on its own after connecting, and that value used to stay in the cache.
+        result.getOrNull()?.let { mtu ->
+            val deviceId = gatt.device.address
+            mainThreadHandler?.post { callbackChannel?.onMtuChanged(deviceId, mtu) {} }
+        }
         // GATT callbacks run on Binder threads. Match the main-looper delivery
         // used by other BLE completions, after removing requests under the lock.
         for (future in pending) postMtuResult(future.result, result)

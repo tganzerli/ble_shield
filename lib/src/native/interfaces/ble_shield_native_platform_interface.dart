@@ -15,6 +15,7 @@ abstract class BleShieldNativePlatform {
   OnAvailabilityChange? onAvailabilityChange;
   OnPairingStateChange? onPairingStateChange;
   OnConnectionParametersChange? onConnectionParametersChange;
+  OnMtuChange? onMtuChange;
   // Last pairing/bond state seen per canonical device id (see updatePairingState). Bond state outlives a
   // connection, so unlike _lastConnectionParametersMap this is not cleared on disconnect.
   final Map<String, bool> _lastPairStateMap = {};
@@ -313,6 +314,14 @@ abstract class BleShieldNativePlatform {
     final canonicalId = _deviceId(deviceId).canonical;
     if (_isDuplicateState(_lastPairStateMap, canonicalId, isPaired)) return;
     _emitPairingState(canonicalId, isPaired);
+  }
+
+  /// The ATT MTU the platform reported for [deviceId], requested or not.
+  /// Not de-duplicated: the consumer keeps the last value.
+  void updateMtu(String deviceId, int mtu) {
+    try {
+      onMtuChange?.call(_deviceId(deviceId).canonical, mtu);
+    } catch (_) {}
   }
 
   /// A failed bond is an event, not a state: it reports `isPaired: false` regardless of what was cached before,

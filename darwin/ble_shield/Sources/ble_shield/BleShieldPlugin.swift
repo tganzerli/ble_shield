@@ -700,6 +700,10 @@ private class BleCentralDarwin: NSObject, BleShieldNativePlatformChannel, BleShi
 
   public func centralManager(_: CBCentralManager, didConnect peripheral: CBPeripheral) {
     callbackChannel.onConnectionChanged(deviceId: peripheral.uuid.uuidString, connected: true, error: nil, errorCode: nil, nativeErrorCode: nil) { _ in }
+    // Apple negotiates the MTU itself and has no callback for it: report the
+    // value the connection has now (same formula as requestMtu).
+    let mtu = Int64(peripheral.maximumWriteValueLength(for: CBCharacteristicWriteType.withoutResponse) + 3)
+    callbackChannel.onMtuChanged(deviceId: peripheral.uuid.uuidString, mtu: mtu) { _ in }
   }
 
   private func handlePeripheralDisconnection(deviceId: String, error: Error?) {

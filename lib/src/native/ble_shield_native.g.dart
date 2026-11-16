@@ -2278,6 +2278,13 @@ abstract class BleShieldNativeCallbackChannel {
   Future<void> onConnectionParametersUpdated(
       BleConnectionParametersChange update);
 
+  /// The ATT MTU of a connection, sent whenever the platform reports it,
+  /// requested or not: Android on every successful `onMtuChanged` (Android 14+
+  /// negotiates on its own after connecting); Apple on connect, as
+  /// `maximumWriteValueLength(.withoutResponse) + 3`, since it has no
+  /// negotiation callback.
+  Future<void> onMtuChanged(String deviceId, int mtu);
+
   static void setUp(
     BleShieldNativeCallbackChannel? api, {
     BinaryMessenger? binaryMessenger,
@@ -2451,6 +2458,30 @@ abstract class BleShieldNativeCallbackChannel {
               args[0]! as BleConnectionParametersChange;
           try {
             await api.onConnectionParametersUpdated(arg_update);
+            return wrapResponse(empty: true);
+          } on PlatformException catch (e) {
+            return wrapResponse(error: e);
+          } catch (e) {
+            return wrapResponse(
+                error: PlatformException(code: 'error', message: e.toString()));
+          }
+        });
+      }
+    }
+    {
+      final pigeonVar_channel = BasicMessageChannel<Object?>(
+          'dev.flutter.pigeon.ble_shield.BleShieldNativeCallbackChannel.onMtuChanged$messageChannelSuffix',
+          pigeonChannelCodec,
+          binaryMessenger: binaryMessenger);
+      if (api == null) {
+        pigeonVar_channel.setMessageHandler(null);
+      } else {
+        pigeonVar_channel.setMessageHandler((Object? message) async {
+          final List<Object?> args = message! as List<Object?>;
+          final String arg_deviceId = args[0]! as String;
+          final int arg_mtu = args[1]! as int;
+          try {
+            await api.onMtuChanged(arg_deviceId, arg_mtu);
             return wrapResponse(empty: true);
           } on PlatformException catch (e) {
             return wrapResponse(error: e);

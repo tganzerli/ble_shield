@@ -2072,6 +2072,12 @@ protocol BleShieldNativeCallbackChannelProtocol {
   /// Both are `null` when there is no error or the platform has no code.
   func onConnectionChanged(deviceId deviceIdArg: String, connected connectedArg: Bool, error errorArg: String?, errorCode errorCodeArg: BleShieldNativeErrorCode?, nativeErrorCode nativeErrorCodeArg: Int64?, completion: @escaping (Result<Void, PigeonError>) -> Void)
   func onConnectionParametersUpdated(update updateArg: BleConnectionParametersChange, completion: @escaping (Result<Void, PigeonError>) -> Void)
+  /// The ATT MTU of a connection, sent whenever the platform reports it,
+  /// requested or not: Android on every successful `onMtuChanged` (Android 14+
+  /// negotiates on its own after connecting); Apple on connect, as
+  /// `maximumWriteValueLength(.withoutResponse) + 3`, since it has no
+  /// negotiation callback.
+  func onMtuChanged(deviceId deviceIdArg: String, mtu mtuArg: Int64, completion: @escaping (Result<Void, PigeonError>) -> Void)
 }
 class BleShieldNativeCallbackChannel: BleShieldNativeCallbackChannelProtocol {
   private let binaryMessenger: FlutterBinaryMessenger
@@ -2208,6 +2214,29 @@ class BleShieldNativeCallbackChannel: BleShieldNativeCallbackChannelProtocol {
     let channelName: String = "dev.flutter.pigeon.ble_shield.BleShieldNativeCallbackChannel.onConnectionParametersUpdated\(messageChannelSuffix)"
     let channel = FlutterBasicMessageChannel(name: channelName, binaryMessenger: binaryMessenger, codec: codec)
     channel.sendMessage([updateArg] as [Any?]) { response in
+      guard let listResponse = response as? [Any?] else {
+        completion(.failure(createConnectionError(withChannelName: channelName)))
+        return
+      }
+      if listResponse.count > 1 {
+        let code: String = listResponse[0] as! String
+        let message: String? = nilOrValue(listResponse[1])
+        let details: String? = nilOrValue(listResponse[2])
+        completion(.failure(PigeonError(code: code, message: message, details: details)))
+      } else {
+        completion(.success(()))
+      }
+    }
+  }
+  /// The ATT MTU of a connection, sent whenever the platform reports it,
+  /// requested or not: Android on every successful `onMtuChanged` (Android 14+
+  /// negotiates on its own after connecting); Apple on connect, as
+  /// `maximumWriteValueLength(.withoutResponse) + 3`, since it has no
+  /// negotiation callback.
+  func onMtuChanged(deviceId deviceIdArg: String, mtu mtuArg: Int64, completion: @escaping (Result<Void, PigeonError>) -> Void) {
+    let channelName: String = "dev.flutter.pigeon.ble_shield.BleShieldNativeCallbackChannel.onMtuChanged\(messageChannelSuffix)"
+    let channel = FlutterBasicMessageChannel(name: channelName, binaryMessenger: binaryMessenger, codec: codec)
+    channel.sendMessage([deviceIdArg, mtuArg] as [Any?]) { response in
       guard let listResponse = response as? [Any?] else {
         completion(.failure(createConnectionError(withChannelName: channelName)))
         return

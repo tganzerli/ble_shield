@@ -38,10 +38,10 @@ class BleShieldNative {
     _bleCommandQueue.timeout = duration;
   }
 
-  /// Set log level for both Dart and native implementations.
-  /// Only effective in debug builds.
+  /// Set log level for both Dart and native implementations, in any build
+  /// mode (ble_shield: the upstream debug-only guard is dropped, so a release
+  /// build can be diagnosed). The default stays [BleLogLevel.none].
   static Future<void> setLogLevel(BleLogLevel logLevel) async {
-    if (!kDebugMode) return;
     UniversalLogger.setLogLevel(logLevel);
     await _platform.setLogLevel(logLevel);
   }
@@ -1264,6 +1264,11 @@ class BleShieldNative {
     OnConnectionParametersChange? onConnectionParametersChange,
   ) =>
       _platform.onConnectionParametersChange = onConnectionParametersChange;
+
+  /// ATT MTU reports, requested or not (Android on every successful
+  /// negotiation, Apple on connect).
+  static set onMtuChange(OnMtuChange? onMtuChange) =>
+      _platform.onMtuChange = onMtuChange;
 
   static BleShieldNativePlatform _defaultPlatform() {
     return BleShieldNativePigeonChannel.instance;

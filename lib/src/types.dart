@@ -139,3 +139,42 @@ class InMemoryRestoredIdStore implements RestoredIdStore {
 /// Opts the engine into iOS central state restoration. The default calls
 /// `BleShieldNativeDarwinCentral.configureRestoration`.
 typedef RestorationConfigurator = Future<bool> Function(String identifier);
+
+/// Verbosity of the native layer's own logs ([BleShield.setNativeLogLevel]):
+/// logcat tag `BleShieldNative` on Android, stdout on Apple. Each level
+/// includes the ones before it.
+enum ShieldLogLevel { none, error, warning, info, debug, verbose }
+
+/// Connection parameters of a link, as the Android controller reports them
+/// (API 26+). Apple exposes none.
+class ShieldConnectionParameters {
+  const ShieldConnectionParameters({
+    required this.interval,
+    required this.latency,
+    required this.supervisionTimeout,
+  });
+
+  /// Time between connection events (the link's pace for notifications).
+  final Duration interval;
+
+  /// Connection events the peripheral may skip.
+  final int latency;
+
+  /// How long without traffic before the link is considered lost.
+  final Duration supervisionTimeout;
+
+  @override
+  bool operator ==(Object other) =>
+      other is ShieldConnectionParameters &&
+      other.interval == interval &&
+      other.latency == latency &&
+      other.supervisionTimeout == supervisionTimeout;
+
+  @override
+  int get hashCode => Object.hash(interval, latency, supervisionTimeout);
+
+  @override
+  String toString() => 'ShieldConnectionParameters(interval: '
+      '${interval.inMicroseconds / 1000} ms, latency: $latency, '
+      'supervisionTimeout: ${supervisionTimeout.inMilliseconds} ms)';
+}

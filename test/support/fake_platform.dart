@@ -130,6 +130,32 @@ class FakeBlePlatform extends BleShieldPlatform {
   /// When set, the native `disconnect` throws it (the link is left as is).
   Object? disconnectError;
 
+  // ---- diagnostics ----
+  BleLogLevel? logLevel;
+
+  @override
+  Future<void> setLogLevel(BleLogLevel logLevel) async {
+    calls.add('setLogLevel:${logLevel.name}');
+    this.logLevel = logLevel;
+  }
+
+  void emitMtu(String id, int mtu) => updateMtu(id, mtu);
+
+  void emitConnectionParameters(
+    String id, {
+    required int interval,
+    int latency = 0,
+    int supervisionTimeout = 500,
+    int status = 0,
+  }) =>
+      updateConnectionParameters(BleConnectionParametersChange(
+        deviceId: id,
+        interval: interval,
+        latency: latency,
+        supervisionTimeout: supervisionTimeout,
+        status: status,
+      ));
+
   void emitConnection(
     String id,
     bool connected, {

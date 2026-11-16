@@ -362,6 +362,10 @@ class BleShieldNativePigeonChannel extends BleShieldNativePlatform
     BleConnectionParametersChange update,
   ) async =>
       updateConnectionParameters(update);
+
+  @override
+  Future<void> onMtuChanged(String deviceId, int mtu) async =>
+      updateMtu(deviceId, mtu);
 }
 
 extension _BleServiceExtension on BleShieldNativeService {

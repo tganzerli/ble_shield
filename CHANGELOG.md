@@ -1,3 +1,14 @@
+## 0.2.1
+
+- Diagnostics (public API contract 3.1, additive):
+  `BleShield.setNativeLogLevel(ShieldLogLevel)` turns on the native layer's
+  logs in any build mode (the upstream debug-only guard is gone);
+  `ShieldDevice.mtuNow`/`mtu` report the ATT MTU the platform negotiated,
+  requested or not (Android on every negotiation, Apple on connect);
+  `ShieldDevice.connectionParametersNow`/`connectionParameters` report the
+  Android connection interval, latency and supervision timeout (Android 8+).
+- Native: new `onMtuChanged` callback on the Pigeon callback channel.
+
 ## 0.2.0
 
 First published version.

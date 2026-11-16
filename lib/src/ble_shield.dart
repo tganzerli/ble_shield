@@ -126,6 +126,42 @@ class BleShield {
     // Global listener: device state, and restored peripherals that have no
     // ShieldDevice yet. ble_shield owns this native callback slot.
     BleShieldNative.onConnectionChange = _onConnectionChange;
+    // Diagnostics, routed to devices this engine already handed out. An event
+    // for an unknown id is dropped: the value comes back on the next change.
+    BleShieldNative.onMtuChange =
+        (id, mtu) => _devices[canonicalRemoteId(id)]?._setMtu(mtu);
+    BleShieldNative.onConnectionParametersChange = (update) {
+      if (!update.isSuccess) return;
+      _devices[canonicalRemoteId(update.deviceId)]?._setConnectionParameters(
+        ShieldConnectionParameters(
+          interval: Duration(microseconds: update.interval * 1250),
+          latency: update.latency,
+          supervisionTimeout:
+              Duration(milliseconds: update.supervisionTimeout * 10),
+        ),
+      );
+    };
+  }
+
+  /// Sets the verbosity of the native layer's own logs (logcat tag
+  /// `BleShieldNative` on Android, stdout on Apple, and `dart:developer` for
+  /// its Dart half), in any build mode. The
+  /// default is [ShieldLogLevel.none]. `debug` shows each MTU and
+  /// connection-parameter change; `verbose` adds a line per notification, so
+  /// do not leave it on in production.
+  ///
+  /// Process-wide (every engine shares the native layer). Makes no other
+  /// native call and does not create the iOS central.
+  Future<void> setNativeLogLevel(ShieldLogLevel level) async {
+    _install();
+    await BleShieldNative.setLogLevel(switch (level) {
+      ShieldLogLevel.none => BleLogLevel.none,
+      ShieldLogLevel.error => BleLogLevel.error,
+      ShieldLogLevel.warning => BleLogLevel.warning,
+      ShieldLogLevel.info => BleLogLevel.info,
+      ShieldLogLevel.debug => BleLogLevel.debug,
+      ShieldLogLevel.verbose => BleLogLevel.verbose,
+    });
   }
 
   void _onConnectionChange(BleConnectionChange change) {

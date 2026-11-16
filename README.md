@@ -66,6 +66,7 @@ device.reconnectEvents.listen(print); // "[Reconnect] aa:bb:… fired origin=dro
 | `device(remoteId)` | Same `ShieldDevice` per id (case-insensitive) until it is disposed. |
 | `configureRestoration(id)` | iOS state restoration, see below. |
 | `restoredIds`, `restoredDevices()`, `forgetRestoredId(id)` | Peripherals the OS reported connected without a connect from ble_shield. |
+| `setNativeLogLevel(level)` | Logs of the native layer, see *Diagnostics*. |
 | `dispose()` | Stops listening. |
 
 ### `ShieldDevice`
@@ -78,6 +79,7 @@ device.reconnectEvents.listen(print); // "[Reconnect] aa:bb:… fired origin=dro
 | `setAutoReconnect(enabled, {delay = 3 s})`, `autoReconnect` | See *Reconnection*. |
 | `reconnectEvents` | `ReconnectEvent(outcome: fired/skipped/failed, origin, reason)`. |
 | `discoverServices()` | Real discovery on the first call of each connection, cached until it ends. |
+| `mtuNow`, `mtu`; `connectionParametersNow`, `connectionParameters` | Link diagnostics, see *Diagnostics*. |
 | `dispose()` | Cancels an armed attempt and releases a pending OS request. It does not disconnect. |
 
 `ShieldCharacteristic` has `canRead`, `canWrite`, `canNotify` (notify **or**
@@ -97,6 +99,35 @@ code is one of `adapterOff`, `notConnected`, `deviceNotFound`,
 `unsupported`, `unauthorized`, `invalidArgument` or `unknown`. No raw plugin
 exception escapes. Asynchronous failures go to `scanErrors` and
 `reconnectEvents`; nothing goes to the zone.
+
+## Diagnostics
+
+For a slow or unstable link, the app can see what the link negotiated and turn
+on the native layer's own logs, in any build mode:
+
+```dart
+await shield.setNativeLogLevel(ShieldLogLevel.debug); // default: none
+
+device.mtu.listen((mtu) => log('mtu=$mtu'));
+device.connectionParameters.listen((p) => log('params=$p'));
+```
+
+- `setNativeLogLevel` is process-wide. The native logs go to logcat (tag
+  `BleShieldNative`) on Android and to stdout on Apple; the Dart half of the
+  native layer logs through `dart:developer` (`BleShieldNative:*`). No log
+  reaches a Dart stream. `debug`
+  shows each MTU and connection-parameter change; `verbose` adds a line per
+  notification, so do not leave it on in production. It makes no other native
+  call and does not create the iOS central.
+- `mtuNow` / `mtu`: the ATT MTU the platform reported, `null` until it reports
+  one and again after a disconnection. Android reports every negotiation,
+  including the one Android 14+ makes on its own after connecting; Apple
+  reports it on connect. A link the OS already had (for example, a device still
+  connected from a previous process) may keep an MTU that was never reported,
+  so `null` means "unknown", not 23. ble_shield does not request an MTU itself.
+- `connectionParametersNow` / `connectionParameters`: interval, latency and
+  supervision timeout, when the Android controller reports them (Android 8+,
+  on each update). Always `null` on Apple and on older Android.
 
 ## Reconnection
 

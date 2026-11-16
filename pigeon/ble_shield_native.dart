@@ -558,6 +558,14 @@ abstract class BleShieldNativeCallbackChannel {
 
   @asyncCallback
   void onConnectionParametersUpdated(BleConnectionParametersChange update);
+
+  /// The ATT MTU of a connection, sent whenever the platform reports it,
+  /// requested or not: Android on every successful `onMtuChanged` (Android 14+
+  /// negotiates on its own after connecting); Apple on connect, as
+  /// `maximumWriteValueLength(.withoutResponse) + 3`, since it has no
+  /// negotiation callback.
+  @asyncCallback
+  void onMtuChanged(String deviceId, int mtu);
 }
 
 /// Flutter -> Native (Apple central restoration only).

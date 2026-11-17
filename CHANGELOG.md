@@ -1,3 +1,9 @@
+## 0.2.2
+
+- Android: `ShieldDevice.connectionParameters` now works in minified release
+  builds. The plugin ships a consumer ProGuard rule that keeps the hidden
+  `onConnectionUpdated` callback, which the code shrinker used to strip.
+
 ## 0.2.1
 
 - Diagnostics (public API contract 3.1, additive):

@@ -1312,6 +1312,7 @@ class BleShieldPlugin : BleShieldNativePlatformChannel, BluetoothGattCallback(),
 
     // BluetoothGattCallback.onConnectionUpdated is @hide (not in public android.jar).
     // Same method name is required so the framework invokes it at runtime; no `override`.
+    // The code shrinker would strip it as unused: android/consumer-rules.pro keeps it.
     @Suppress("unused")
     fun onConnectionUpdated(
         gatt: BluetoothGatt?,

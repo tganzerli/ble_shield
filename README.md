@@ -20,10 +20,20 @@ plain plugin leaves to the caller:
 - one error type with typed codes;
 - opt-in iOS central state restoration for apps with several engines.
 
-Status: `0.2.0-dev`, not published. It has no dependency on universal_ble, on
-`bluez`/`dbus` or on `flutter_web_bluetooth`, and its native identity
-(Android package, classes, Pigeon channels, iOS module) is its own, so it can
-share an app with universal_ble or flutter_blue_plus.
+ble_shield is published on [pub.dev](https://pub.dev/packages/ble_shield) for
+Android and iOS. It has no dependency on universal_ble, on `bluez`/`dbus` or
+on `flutter_web_bluetooth`, and its native identity (Android package, classes,
+Pigeon channels, iOS module) is its own, so it can share an app with
+universal_ble or flutter_blue_plus.
+
+## Installation
+
+```sh
+flutter pub add ble_shield
+```
+
+Then declare the Bluetooth permissions and request them at runtime, as
+described in *Permissions*. ble_shield does not request them for you.
 
 ## Quick start
 
@@ -47,7 +57,46 @@ device.setAutoReconnect(true); // re-armed 3 s after every drop
 device.reconnectEvents.listen(print); // "[Reconnect] aa:bb:… fired origin=drop"
 ```
 
+## Permissions
+
+Declare what the platform needs:
+
+- **Android** (`AndroidManifest.xml`): `BLUETOOTH_SCAN` and `BLUETOOTH_CONNECT`
+  on API 31+, and `ACCESS_FINE_LOCATION` for scanning on API 30 and below:
+
+  ```xml
+  <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+      android:usesPermissionFlags="neverForLocation" />
+  <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+  <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"
+      android:maxSdkVersion="30" />
+  ```
+
+- **iOS** (`Info.plist`): `NSBluetoothAlwaysUsageDescription`.
+
+ble_shield does **not** request runtime permissions and has no API for them.
+Request them in the app (for example with `permission_handler`) before
+scanning or connecting. On iOS the system prompt appears when the central
+manager is created, which happens on the first central call, not in the
+`BleShield()` constructor.
+
 ## API overview
+
+### Configuration
+
+All options are constructor parameters of `BleShield`:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `canTurnOn` | `true` | `false` makes `turnOn()` fail at once with `unsupported` (for background engines). |
+| `turnOnTimeout` | 30 s | Bound for `turnOn()`. |
+| `scanWatchdog` | `null` (off) | Warns on `scanErrors` when no advertisement arrives within this window. It never ends the scan. |
+| `closeGattOnDetach` | `true` | Closes this engine's GATT clients when the engine detaches (Android). |
+| `releaseTimeout` | 5 s | Bound for the internal disconnect that cancels a failed or timed-out connect. |
+| `pendingConnectWindow` | 1 day | Dart-side bound for a reconnection request. When it passes, ble_shield stops waiting; the OS request stays pending. |
+| `gattTimeout` | 10 s | Default bound for discovery, read and write. |
+| `adapterStateTimeout` | 3 s | How long a new `adapterState` subscriber waits for the platform's first answer. |
+| `restoredIdStore` | in memory | Storage for iOS restored ids, see *iOS state restoration*. |
 
 ### `BleShield` (central)
 
@@ -57,7 +106,7 @@ device.reconnectEvents.listen(print); // "[Reconnect] aa:bb:… fired origin=dro
 | `adapterStateNow`, `adapterState` | Cached `AdapterState` (`unknown`, `resetting`, `unsupported`, `unauthorized`, `off`, `on`); the stream replays the current value. On a new engine its first event waits for the platform's first answer (up to `adapterStateTimeout`, 3 s), so it never starts with a transient `unknown`. |
 | `isSupported({wait})` | False only when the platform reports no BLE. |
 | `turnOn()` | Android with an Activity only. Throws `unsupported` on Apple or with `canTurnOn: false`, `operationTimeout` after `turnOnTimeout`. Never hangs. |
-| `startScan({withServices, mode, removeIfGone})` | Throws `scanAlreadyStarted` during a scan. Start failures are thrown and also emitted on `scanErrors`, and the native scan is stopped. |
+| `startScan({withServices, mode, removeIfGone})` | Throws `scanAlreadyStarted` during a scan. Start failures are thrown and also emitted on `scanErrors`, and the native scan is stopped. `mode` (`lowPower` by default, `balanced`, `lowLatency`) applies to Android only. |
 | `stopScan()` | Idempotent, always sent to the native scanner, never throws. |
 | `isScanningNow`, `isScanning` | Scan state kept by ble_shield, not a native flag. |
 | `scanResults` | Aggregated `List<ScanResult>`, re-emitted on every advertisement. |
@@ -78,17 +127,44 @@ device.reconnectEvents.listen(print); // "[Reconnect] aa:bb:… fired origin=dro
 | `disconnect({timeout = 35 s, rearm = true})` | Cancels an armed reconnection first, except, by default, one armed by a link loss on a device that is already disconnected (see *Reconnection*). Cancels an in-flight `connect` at once. `rearm: false` ends the session without re-arming auto-reconnect until the next connection (see *Reconnection*). |
 | `setAutoReconnect(enabled, {delay = 3 s})`, `autoReconnect` | See *Reconnection*. |
 | `reconnectEvents` | `ReconnectEvent(outcome: fired/skipped/failed, origin, reason)`. |
-| `discoverServices()` | Real discovery on the first call of each connection, cached until it ends. |
+| `discoverServices({timeout})` | Real discovery on the first call of each connection, cached until it ends. `timeout` defaults to `gattTimeout`. |
 | `mtuNow`, `mtu`; `connectionParametersNow`, `connectionParameters` | Link diagnostics, see *Diagnostics*. |
 | `dispose()` | Cancels an armed attempt and releases a pending OS request. It does not disconnect. |
 
-`ShieldCharacteristic` has `canRead`, `canWrite`, `canNotify` (notify **or**
-indicate), `isNotifying`, `read()`, `write(value, {withoutResponse = false})`,
-`setNotify(enabled, {timeout = 15 s})` (picks notify or indicate) and
-`onValueReceived` (this device and characteristic only).
+`ShieldCharacteristic` has:
+
+- properties: `canRead`, `canWrite` (`canWriteWithResponse` or
+  `canWriteWithoutResponse`), `canNotify` (`supportsNotify` or
+  `supportsIndicate`) and `isNotifying`;
+- `read({timeout})` and `write(value, {withoutResponse = false, timeout})`, both
+  bounded by `gattTimeout` unless `timeout` is given;
+- `setNotify(enabled, {timeout = 15 s})`, which picks notify or indicate;
+- `onValueReceived`, for this device and characteristic only.
+
+### Scan results
+
+`scanResults` emits a `List<ScanResult>`, one entry per device:
+
+| Field | Content |
+|---|---|
+| `remoteId` | Lower-case id: MAC address on Android, CoreBluetooth UUID on Apple. |
+| `name` | Name reported for the advertisement, empty if none. |
+| `rssi` | Signal strength; -127 when the platform reported none. |
+| `connectable` | `true` unless the platform said otherwise. |
+| `manufacturerData` | Company id → payload, without the two company id bytes. |
+| `serviceUuids`, `serviceData` | Advertised services and their data, canonical UUIDs. |
+| `lastSeen` | When the scanner last saw the device. |
+
+The whole list is re-emitted on every advertisement. On iOS one discovery may
+arrive as two emissions a fraction of a millisecond apart (the advertisement
+and its scan response), so a listener that starts work on each emission should
+be idempotent.
+
+### UUIDs and ids
 
 All UUIDs are accepted as 16, 32 or 128 bits and emitted as canonical 128-bit
-lower-case strings. Remote ids are emitted in lower case.
+lower-case strings; `canonicalUuid(uuid)` gives the same form for your own
+constants. Remote ids are emitted in lower case.
 
 ### Errors
 
@@ -106,7 +182,7 @@ For a slow or unstable link, the app can see what the link negotiated and turn
 on the native layer's own logs, in any build mode:
 
 ```dart
-await shield.setNativeLogLevel(ShieldLogLevel.debug); // default: none
+await ble.setNativeLogLevel(ShieldLogLevel.debug); // default: none
 
 device.mtu.listen((mtu) => log('mtu=$mtu'));
 device.connectionParameters.listen((p) => log('params=$p'));
@@ -124,10 +200,13 @@ device.connectionParameters.listen((p) => log('params=$p'));
   including the one Android 14+ makes on its own after connecting; Apple
   reports it on connect. A link the OS already had (for example, a device still
   connected from a previous process) may keep an MTU that was never reported,
-  so `null` means "unknown", not 23. ble_shield does not request an MTU itself.
+  so `null` means "unknown", not 23. On Android, an MTU exchange that the
+  peripheral starts may also go unreported. ble_shield does not request an MTU
+  itself.
 - `connectionParametersNow` / `connectionParameters`: interval, latency and
   supervision timeout, when the Android controller reports them (Android 8+,
-  on each update). Always `null` on Apple and on older Android.
+  on each update), in debug and in minified release builds alike. Always `null`
+  on Apple and on older Android.
 
 ## Reconnection
 
@@ -226,16 +305,16 @@ background one):
   the native layer would connect to every device to discover its services. The
   filter therefore runs in Dart, using the services ble_shield has seen
   advertised or discovered. Devices whose services are unknown are kept.
+- Minified release builds need no ProGuard rule from the app: the plugin ships
+  its own consumer rules.
 
 ## Platforms
 
 Android (`minSdk` 21) and iOS (13.1). The Darwin sources are shared and build
 for macOS too, but macOS is not declared yet.
 
-Android: declare `BLUETOOTH_SCAN` and `BLUETOOTH_CONNECT` (API 31+) or
-location (API 30 and below) in the app manifest. iOS: declare
-`NSBluetoothAlwaysUsageDescription`. Both CocoaPods and Swift Package Manager
-builds are supported. See `example/`.
+Permissions are described in *Permissions*. Both CocoaPods and Swift Package
+Manager builds are supported. See `example/` for a complete app.
 
 ## Testing
 

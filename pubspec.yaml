@@ -2,7 +2,7 @@ name: ble_shield
 description: >-
   Defensive BLE central for Flutter (Android, iOS): cached state, aggregated
   scan, serialized GATT, connect timeouts, managed auto-reconnect, typed errors.
-version: 0.2.2
+version: 0.2.3
 homepage: https://github.com/tganzerli/ble_shield
 repository: https://github.com/tganzerli/ble_shield
 issue_tracker: https://github.com/tganzerli/ble_shield/issues

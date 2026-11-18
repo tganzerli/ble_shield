@@ -1,3 +1,10 @@
+## 0.2.3
+
+- Documentation only: the README covers installation, runtime permissions
+  (requested by the app, not by ble_shield), the constructor options and their
+  defaults, GATT timeouts and capability getters, scan result fields, and the
+  MTU and scan caveats per platform. No code change.
+
 ## 0.2.2
 
 - Android: `ShieldDevice.connectionParameters` now works in minified release

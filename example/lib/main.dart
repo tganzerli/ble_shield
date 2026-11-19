@@ -64,6 +64,25 @@ class _ScanPageState extends State<ScanPage> {
     }
   }
 
+  /// Web has no free scan: the browser's chooser picks one device. The page
+  /// may only use the services it lists, so ask for them first.
+  Future<void> _chooseDevice() async {
+    final services = await showDialog<List<String>>(
+      context: context,
+      builder: (_) => const _ServicesDialog(),
+    );
+    if (services == null || !mounted) return;
+    try {
+      final r = await shield.requestDevice(optionalServices: services);
+      if (!mounted) return;
+      await Navigator.of(context).push(MaterialPageRoute<void>(
+        builder: (_) => DevicePage(device: shield.device(r.remoteId)),
+      ));
+    } on ShieldError catch (e) {
+      _show('Choose device: ${e.code.name} ${e.message}');
+    }
+  }
+
   Future<void> _configureRestoration() async {
     final granted = await shield.configureRestoration(restorationId);
     setState(() => _restoration = granted
@@ -91,15 +110,21 @@ class _ScanPageState extends State<ScanPage> {
               ),
           ],
         ),
-        floatingActionButton: StreamBuilder<bool>(
-          stream: shield.isScanning,
-          initialData: shield.isScanningNow,
-          builder: (_, s) => FloatingActionButton.extended(
-            onPressed: _toggleScan,
-            icon: Icon(s.data! ? Icons.stop : Icons.search),
-            label: Text(s.data! ? 'Stop' : 'Scan'),
-          ),
-        ),
+        floatingActionButton: kIsWeb
+            ? FloatingActionButton.extended(
+                onPressed: _chooseDevice,
+                icon: const Icon(Icons.bluetooth_searching),
+                label: const Text('Choose device'),
+              )
+            : StreamBuilder<bool>(
+                stream: shield.isScanning,
+                initialData: shield.isScanningNow,
+                builder: (_, s) => FloatingActionButton.extended(
+                  onPressed: _toggleScan,
+                  icon: Icon(s.data! ? Icons.stop : Icons.search),
+                  label: Text(s.data! ? 'Stop' : 'Scan'),
+                ),
+              ),
         body: Column(
           children: [
             if (_restoration != null)
@@ -129,6 +154,49 @@ class _ScanPageState extends State<ScanPage> {
             ),
           ],
         ),
+      );
+}
+
+/// Asks for the service UUIDs the page will use after connecting.
+class _ServicesDialog extends StatefulWidget {
+  const _ServicesDialog();
+
+  @override
+  State<_ServicesDialog> createState() => _ServicesDialogState();
+}
+
+class _ServicesDialogState extends State<_ServicesDialog> {
+  final _controller = TextEditingController();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+        title: const Text('Services to use'),
+        content: TextField(
+          controller: _controller,
+          decoration: const InputDecoration(
+            hintText: '180d, 0000180f-0000-1000-8000-00805f9b34fb',
+            helperText: 'Comma-separated. The browser blocks the others.',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, [
+              for (final s in _controller.text.split(','))
+                if (s.trim().isNotEmpty) s.trim(),
+            ]),
+            child: const Text('Choose device'),
+          ),
+        ],
       );
 }
 

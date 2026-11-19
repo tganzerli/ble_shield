@@ -1,6 +1,6 @@
 # ble_shield
 
-A defensive BLE central plugin for Flutter (Android, iOS and macOS). It ships
+A defensive BLE central plugin for Flutter (Android, iOS, macOS and Web). It ships
 its own native layer, derived from
 [universal_ble](https://pub.dev/packages/universal_ble) 3.2.0 (see
 *Third-party code*), and adds the things a long-running BLE app needs and a
@@ -21,10 +21,10 @@ plain plugin leaves to the caller:
 - opt-in iOS central state restoration for apps with several engines.
 
 ble_shield is published on [pub.dev](https://pub.dev/packages/ble_shield) for
-Android, iOS and macOS. It has no dependency on universal_ble, on `bluez`/`dbus` or
-on `flutter_web_bluetooth`, and its native identity (Android package, classes,
-Pigeon channels, iOS module) is its own, so it can share an app with
-universal_ble or flutter_blue_plus.
+Android, iOS, macOS and Web. It has no dependency on universal_ble, on
+`bluez`/`dbus`, on `flutter_web_bluetooth` or on `package:web`, and its native
+identity (Android package, classes, Pigeon channels, iOS module) is its own,
+so it can share an app with universal_ble or flutter_blue_plus.
 
 ## Installation
 
@@ -84,6 +84,14 @@ Declare what the platform needs:
   <true/>
   ```
 
+- **Web**: nothing to declare. Web Bluetooth needs a secure context (HTTPS, or
+  `localhost` during development, which `flutter run -d chrome` uses) and a
+  browser that ships it: Chromium-based browsers (Chrome, Edge, Opera) on
+  desktop and Android; Safari and Firefox do not. Each device is granted by
+  the user in the browser's chooser (`requestDevice`), which must be opened
+  from a user gesture, and the page may only use the services it listed
+  there.
+
 ble_shield does **not** request runtime permissions and has no API for them.
 Request them in the app (for example with `permission_handler`) before
 scanning or connecting. On iOS the system prompt appears when the central
@@ -116,13 +124,14 @@ All options are constructor parameters of `BleShield`:
 | `adapterStateNow`, `adapterState` | Cached `AdapterState` (`unknown`, `resetting`, `unsupported`, `unauthorized`, `off`, `on`); the stream replays the current value. On a new engine its first event waits for the platform's first answer (up to `adapterStateTimeout`, 3 s), so it never starts with a transient `unknown`. |
 | `isSupported({wait})` | False only when the platform reports no BLE. |
 | `turnOn()` | Android with an Activity only. Throws `unsupported` on Apple or with `canTurnOn: false`, `operationTimeout` after `turnOnTimeout`. Never hangs. |
-| `startScan({withServices, mode, removeIfGone})` | Throws `scanAlreadyStarted` during a scan. Start failures are thrown and also emitted on `scanErrors`, and the native scan is stopped. `mode` (`lowPower` by default, `balanced`, `lowLatency`) applies to Android only. |
+| `startScan({withServices, mode, removeIfGone})` | Throws `unsupported` on the web (use `requestDevice`). Throws `scanAlreadyStarted` during a scan. Start failures are thrown and also emitted on `scanErrors`, and the native scan is stopped. `mode` (`lowPower` by default, `balanced`, `lowLatency`) applies to Android only. |
 | `stopScan()` | Idempotent, always sent to the native scanner, never throws. |
+| `requestDevice({withServices, optionalServices, optionalManufacturerData})` | Web only: opens the browser's Bluetooth chooser and returns the picked device as a `ScanResult` (`rssi` -127); connect it with `device(result.remoteId)`. Call it from a user gesture and list every service you will use (`withServices` also filters the chooser). Throws `cancelled` when the user dismisses the chooser, `unauthorized` without a user gesture, `deviceNotFound`, and `unsupported` on other platforms, in browsers without Web Bluetooth and outside a secure context. Does not touch the scan. |
 | `isScanningNow`, `isScanning` | Scan state kept by ble_shield, not a native flag. |
 | `scanResults` | Aggregated `List<ScanResult>`, re-emitted on every advertisement. |
 | `scanErrors` | Start failures, native scanner failures (Android `onScanFailed`, which also end the scan), adapter turning off mid-scan, and the opt-in `scanWatchdog` warning (off by default; it only warns and never ends the scan). |
 | `systemDevices({required withServices})` | Devices connected at OS level. Call `connect()` on them to attach this engine's GATT client. |
-| `device(remoteId)` | Same `ShieldDevice` per id (case-insensitive) until it is disposed. |
+| `device(remoteId)` | Same `ShieldDevice` per id until it is disposed. Case-insensitive on Android and Apple; verbatim on the web. |
 | `configureRestoration(id)` | iOS state restoration, see below. |
 | `restoredIds`, `restoredDevices()`, `forgetRestoredId(id)` | Peripherals the OS reported connected without a connect from ble_shield. |
 | `setNativeLogLevel(level)` | Logs of the native layer, see *Diagnostics*. |
@@ -174,7 +183,10 @@ be idempotent.
 
 All UUIDs are accepted as 16, 32 or 128 bits and emitted as canonical 128-bit
 lower-case strings; `canonicalUuid(uuid)` gives the same form for your own
-constants. Remote ids are emitted in lower case.
+constants. Remote ids are emitted in lower case on Android (MAC) and Apple
+(CoreBluetooth UUID), and accepted in any case. On the web they are the
+browser's opaque, case-sensitive tokens, emitted and matched verbatim: keep
+them as they come.
 
 ### Errors
 
@@ -182,7 +194,10 @@ Every failure is a `ShieldError(code, message, platform, nativeCode)`. The
 code is one of `adapterOff`, `notConnected`, `deviceNotFound`,
 `connectInProgress`, `connectTimeout`, `connectFailed`, `scanAlreadyStarted`,
 `scanFailed`, `characteristicNotFound`, `operationTimeout`, `gattFailed`,
-`unsupported`, `unauthorized`, `invalidArgument` or `unknown`. No raw plugin
+`unsupported`, `unauthorized`, `invalidArgument`, `cancelled` (the user
+dismissed the browser's chooser) or `unknown`. A `switch` over the code
+should keep a default branch: codes are added in minor versions. `platform`
+is `android`, `apple` or `web`. No raw plugin
 exception escapes. Asynchronous failures go to `scanErrors` and
 `reconnectEvents`; nothing goes to the zone.
 
@@ -320,20 +335,24 @@ background one):
 
 ## Platforms
 
-Android (`minSdk` 21), iOS (13.1) and macOS (10.15). iOS and macOS share
-the Darwin sources.
+Android (`minSdk` 21), iOS (13.1), macOS (10.15) and Web (browsers with Web
+Bluetooth, see *Permissions*). iOS and macOS share the Darwin sources.
 
-| | Android | iOS | macOS |
-|---|---|---|---|
-| Scan, connect, GATT, notifications | ✓ | ✓ | ✓ |
-| `systemDevices` | ✓ | ✓ | ✓ |
-| `mtu` | ✓ | ✓ | ✓ |
-| `connectionParameters` | 8.0+ | — | — |
-| `turnOn` | ✓ | — | — |
-| State restoration (`configureRestoration`) | — | ✓ (opt-in) | — |
+| | Android | iOS | macOS | Web |
+|---|---|---|---|---|
+| Scan (`startScan`) | ✓ | ✓ | ✓ | — (`requestDevice`) |
+| Browser chooser (`requestDevice`) | — | — | — | ✓ |
+| Connect, GATT, notifications | ✓ | ✓ | ✓ | ✓ |
+| `systemDevices` | ✓ | ✓ | ✓ | — |
+| `mtu` | ✓ | ✓ | ✓ | — |
+| `connectionParameters` | 8.0+ | — | — | — |
+| `turnOn` | ✓ | — | — | — |
+| State restoration (`configureRestoration`) | — | ✓ (opt-in) | — | — |
 
-Where a feature is missing, `turnOn` throws `ShieldErrorCode.unsupported`,
-`configureRestoration` returns false and `connectionParameters` stays null.
+Where a feature is missing, `turnOn`, `startScan` (web), `requestDevice`
+(outside the web) and `systemDevices` (web) throw `ShieldErrorCode.unsupported`,
+`configureRestoration` returns false, and `mtu` and `connectionParameters` stay
+null.
 
 Permissions are described in *Permissions*. Both CocoaPods and Swift Package
 Manager builds are supported. See `example/` for a complete app.
@@ -351,7 +370,7 @@ may add a dependency that clashes with common Linux or web packages
 | iOS | Available since 0.2.0 |
 | macOS | Available since 0.3.0 |
 | Windows | Planned: C++/WinRT native code, no new Dart dependency |
-| Web | Planned: Web Bluetooth through `dart:js_interop`, with the browser's device chooser in place of a free scan |
+| Web | Available since 0.4.0: Web Bluetooth through `dart:js_interop`, with the browser's device chooser (`requestDevice`) in place of a free scan |
 | Linux | Planned: a separate, optional package, so apps that do not target Linux never resolve `bluez` or `dbus` |
 
 When this rollout is complete, ble_shield moves to **1.0.0**. No dates are

@@ -100,7 +100,7 @@ void main() {
       expect(late, [AdapterState.unknown]);
     });
 
-    test('delivers the cached state after adapterStateTimeout', () async {
+    fakeTest('delivers the cached state after adapterStateTimeout', () async {
       fake.availabilityGate = Completer<void>().future; // never answers
       final shield = BleShield(
         platform: fake,

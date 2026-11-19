@@ -37,7 +37,7 @@ void main() {
   // Field scenario: the user turns Bluetooth off, every device drops, each
   // arms its reconnection, and when the delay ends the adapter is off.
   group('a reconnection failure never leaks', () {
-    test('a native connect that throws is reported, not raised', () async {
+    fakeTest('a native connect that throws is reported, not raised', () async {
       final d = await build();
       await d.connect();
       fake.connectError = PlatformException(
@@ -60,7 +60,7 @@ void main() {
       await d.dispose();
     });
 
-    test('a device disposed during the delay fires no orphan connect',
+    fakeTest('a device disposed during the delay fires no orphan connect',
         () async {
       final d = await build();
       await d.connect();
@@ -74,7 +74,7 @@ void main() {
           contains('[Reconnect] $id skipped origin=drop reason=disposed'));
     });
 
-    test('adapter off skips the attempt; reconnection resumes afterwards',
+    fakeTest('adapter off skips the attempt; reconnection resumes afterwards',
         () async {
       final d = await build();
       await d.connect();
@@ -106,7 +106,7 @@ void main() {
   // up if the device connected or was disconnected by the app meanwhile; the
   // drop never.
   group('kick × drop', () {
-    test(
+    fakeTest(
         'connection + commanded disconnect during the wait ⇒ the kick gives '
         'up; the drop reconnects', () async {
       final d = await build();
@@ -127,7 +127,7 @@ void main() {
       await d.dispose();
     });
 
-    test('no connection in between ⇒ the kick fires', () async {
+    fakeTest('no connection in between ⇒ the kick fires', () async {
       final d = await build();
       d.setAutoReconnect(true, delay: delay);
       await wait(260);
@@ -136,7 +136,7 @@ void main() {
       await d.dispose();
     });
 
-    test('a failed direct connect ⇒ the kick still fires', () async {
+    fakeTest('a failed direct connect ⇒ the kick still fires', () async {
       fake.onConnect = (deviceId, auto) async {
         if (!auto) {
           throw PlatformException(
@@ -154,7 +154,7 @@ void main() {
       await d.dispose();
     });
 
-    test('an uncommanded drop (link loss) ⇒ reconnects', () async {
+    fakeTest('an uncommanded drop (link loss) ⇒ reconnects', () async {
       final d = await build();
       await d.connect();
       d.setAutoReconnect(true, delay: delay);
@@ -167,7 +167,7 @@ void main() {
   });
 
   group('state machine guards', () {
-    test('turning it off during the delay skips with "disabled"', () async {
+    fakeTest('turning it off during the delay skips with "disabled"', () async {
       final d = await build();
       d.setAutoReconnect(true, delay: delay);
       await wait(50);
@@ -177,7 +177,7 @@ void main() {
       expect(log(), ['[Reconnect] $id skipped origin=kick reason=disabled']);
     });
 
-    test('disconnect cancels the armed attempt before the native call',
+    fakeTest('disconnect cancels the armed attempt before the native call',
         () async {
       final d = await build();
       d.setAutoReconnect(true, delay: delay);
@@ -189,7 +189,7 @@ void main() {
       expect(fake.connects, isEmpty);
     });
 
-    test('a pending request is not stacked by repeated kicks', () async {
+    fakeTest('a pending request is not stacked by repeated kicks', () async {
       fake.onConnect = (_, __) async {}; // stays pending
       final d = await build();
       d.setAutoReconnect(true, delay: delay);
@@ -201,7 +201,7 @@ void main() {
       await d.dispose();
     });
 
-    test('a pending request does not hold the GATT lock', () async {
+    fakeTest('a pending request does not hold the GATT lock', () async {
       fake.onConnect = (deviceId, auto) async {
         if (!auto) fake.emitConnection(deviceId, true);
       };
@@ -216,7 +216,7 @@ void main() {
       await d.dispose();
     });
 
-    test('Android: the attempt is a native autoConnect request', () async {
+    fakeTest('Android: the attempt is a native autoConnect request', () async {
       final d = await build();
       d.setAutoReconnect(true, delay: delay);
       await wait(260);
@@ -224,7 +224,7 @@ void main() {
       await d.dispose();
     });
 
-    test('Apple: plain connect, re-issued by ble_shield after each drop',
+    fakeTest('Apple: plain connect, re-issued by ble_shield after each drop',
         () async {
       final d = await build(target: iOS);
       d.setAutoReconnect(true, delay: delay);
@@ -236,7 +236,7 @@ void main() {
       await d.dispose();
     });
 
-    test('a failed attempt is re-armed (retry)', () async {
+    fakeTest('a failed attempt is re-armed (retry)', () async {
       fake.connectError = PlatformException(
           code: '${BleShieldNativeErrorCode.connectionFailed.index}');
       final d = await build();
@@ -247,7 +247,7 @@ void main() {
       await d.dispose();
     });
 
-    test('the default delay is 3 s', () async {
+    fakeTest('the default delay is 3 s', () async {
       final d = await build();
       d.setAutoReconnect(true);
       await wait(2800);
@@ -268,7 +268,7 @@ void main() {
       return d;
     }
 
-    test('ends the session without re-arming; autoReconnect stays on',
+    fakeTest('ends the session without re-arming; autoReconnect stays on',
         () async {
       final d = await session();
       await d.disconnect(rearm: false);
@@ -281,7 +281,7 @@ void main() {
       await d.dispose();
     });
 
-    test('the adapter coming back on does not re-arm either', () async {
+    fakeTest('the adapter coming back on does not re-arm either', () async {
       final d = await session();
       await d.disconnect(rearm: false);
       fake.setAvailability(AvailabilityState.poweredOff);
@@ -293,7 +293,7 @@ void main() {
       await d.dispose();
     });
 
-    test('the next direct connection lifts it: its drop re-arms', () async {
+    fakeTest('the next direct connection lifts it: its drop re-arms', () async {
       final d = await session();
       await d.disconnect(rearm: false);
       await wait(300);
@@ -305,7 +305,7 @@ void main() {
       await d.dispose();
     });
 
-    test('a connection adopted from systemDevices lifts it too', () async {
+    fakeTest('a connection adopted from systemDevices lifts it too', () async {
       final d = await session();
       await d.disconnect(rearm: false);
       await wait(300);
@@ -320,7 +320,7 @@ void main() {
       await d.dispose();
     });
 
-    test('an explicit setAutoReconnect(true) lifts it and kicks', () async {
+    fakeTest('an explicit setAutoReconnect(true) lifts it and kicks', () async {
       final d = await session();
       await d.disconnect(rearm: false);
       await wait(300);
@@ -331,7 +331,7 @@ void main() {
       await d.dispose();
     });
 
-    test('a device that never connected: the kick gives up, nothing after',
+    fakeTest('a device that never connected: the kick gives up, nothing after',
         () async {
       final d = await build();
       d.setAutoReconnect(true, delay: delay);
@@ -346,7 +346,7 @@ void main() {
       await d.dispose();
     });
 
-    test('a connect in flight fails and nothing is armed', () async {
+    fakeTest('a connect in flight fails and nothing is armed', () async {
       fake.onConnect = (deviceId, _) async {
         fake.states[deviceId] = BleConnectionState.connecting;
       };
@@ -363,7 +363,7 @@ void main() {
       await d.dispose();
     });
 
-    test('a later default disconnect does not lift it', () async {
+    fakeTest('a later default disconnect does not lift it', () async {
       final d = await session();
       await d.disconnect(rearm: false);
       await d.disconnect();
@@ -373,7 +373,7 @@ void main() {
       await d.dispose();
     });
 
-    test('a failed disconnect keeps the session re-arming on a real drop',
+    fakeTest('a failed disconnect keeps the session re-arming on a real drop',
         () async {
       final d = await session();
       fake.disconnectEmitsEvent = false; // the link survives the disconnect
@@ -390,7 +390,8 @@ void main() {
       await d.dispose();
     });
 
-    test('a native disconnect error keeps the session re-arming too', () async {
+    fakeTest('a native disconnect error keeps the session re-arming too',
+        () async {
       final d = await session();
       fake.disconnectError = PlatformException(code: 'disconnect-failed');
       await expectLater(
@@ -403,7 +404,8 @@ void main() {
       await d.dispose();
     });
 
-    test('the default disconnect still re-arms (contract unchanged)', () async {
+    fakeTest('the default disconnect still re-arms (contract unchanged)',
+        () async {
       final d = await session();
       await d.disconnect();
       await wait(260);
@@ -430,7 +432,7 @@ void main() {
     int nativeDisconnectsSince(int from) =>
         fake.calls.sublist(from).where((c) => c == 'disconnect:$id').length;
 
-    test('the armed timer of a drop survives and fires', () async {
+    fakeTest('the armed timer of a drop survives and fires', () async {
       final d = await dropped();
       final before = fake.calls.length;
       await d.disconnect();
@@ -444,7 +446,7 @@ void main() {
       await d.dispose();
     });
 
-    test('the pending request of a drop survives and connects', () async {
+    fakeTest('the pending request of a drop survives and connects', () async {
       fake.onConnect = (deviceId, auto) async {
         if (!auto) fake.emitConnection(deviceId, true); // auto stays pending
       };
@@ -460,7 +462,8 @@ void main() {
       await d.dispose();
     });
 
-    test('Apple: the pending plain connect of a drop survives too', () async {
+    fakeTest('Apple: the pending plain connect of a drop survives too',
+        () async {
       fake.onConnect = (deviceId, auto) async {
         if (fake.connects.length == 1) fake.emitConnection(deviceId, true);
       };
@@ -473,7 +476,7 @@ void main() {
       await d.dispose();
     });
 
-    test('a retry armed after a failed attempt survives', () async {
+    fakeTest('a retry armed after a failed attempt survives', () async {
       var autoCalls = 0;
       fake.onConnect = (deviceId, auto) async {
         if (!auto) return fake.emitConnection(deviceId, true);
@@ -496,7 +499,8 @@ void main() {
       await d.dispose();
     });
 
-    test('an attempt armed by the adapter coming back on survives', () async {
+    fakeTest('an attempt armed by the adapter coming back on survives',
+        () async {
       final d = await build();
       await d.connect();
       d.setAutoReconnect(true, delay: delay);
@@ -514,7 +518,7 @@ void main() {
       await d.dispose();
     });
 
-    test('rearm: false still cancels and suspends', () async {
+    fakeTest('rearm: false still cancels and suspends', () async {
       final d = await dropped();
       final before = fake.calls.length;
       await d.disconnect(rearm: false);
@@ -525,7 +529,8 @@ void main() {
       await d.dispose();
     });
 
-    test('with autoReconnect off, disconnect still cancels the pending request',
+    fakeTest(
+        'with autoReconnect off, disconnect still cancels the pending request',
         () async {
       fake.onConnect = (deviceId, auto) async {
         if (!auto) fake.emitConnection(deviceId, true);
@@ -540,7 +545,7 @@ void main() {
       await d.dispose();
     });
 
-    test('a connect in flight: the drop attempt is cancelled as before',
+    fakeTest('a connect in flight: the drop attempt is cancelled as before',
         () async {
       final d = await dropped();
       fake.onConnect = (deviceId, auto) async {
@@ -559,7 +564,8 @@ void main() {
       await d.dispose();
     });
 
-    test('a connected device: the default disconnect is unchanged', () async {
+    fakeTest('a connected device: the default disconnect is unchanged',
+        () async {
       final d = await build();
       await d.connect();
       d.setAutoReconnect(true, delay: delay);
@@ -572,7 +578,7 @@ void main() {
       await d.dispose();
     });
 
-    test('nothing armed: the native disconnect still releases the client',
+    fakeTest('nothing armed: the native disconnect still releases the client',
         () async {
       final d = await build();
       await d.connect();

@@ -22,6 +22,10 @@ void main() {
   late FakeBlePlatform fake;
   late BleShield shield;
 
+  // Built per test; a fakeTest builds its own, because the GATT lock's
+  // completed future must belong to the fake-time zone.
+  BleShield newShield() => BleShield(platform: fake, targetPlatform: android);
+
   setUp(() {
     fake = FakeBlePlatform()
       ..services[id] = [
@@ -33,7 +37,7 @@ void main() {
           ]),
         ]),
       ];
-    shield = BleShield(platform: fake, targetPlatform: android);
+    shield = newShield();
   });
 
   Future<ShieldCharacteristic> characteristicOf() async {
@@ -64,9 +68,10 @@ void main() {
       expect(await shield.adapterState.first, AdapterState.on);
     });
 
-    test(
+    fakeTest(
         'turnOn: unsupported where it cannot work (Apple, no Activity), '
         'never hangs', () async {
+      shield = newShield();
       final apple = BleShield(platform: fake, targetPlatform: iOS);
       await expectLater(apple.turnOn().timeout(const Duration(seconds: 1)),
           throwsA(shieldError(ShieldErrorCode.unsupported)));
@@ -106,9 +111,10 @@ void main() {
       await shield.stopScan();
     });
 
-    test(
+    fakeTest(
         'scanErrors: start failures, native failures and watchdog warnings, '
         'never results', () async {
+      shield = newShield();
       final s = BleShield(
           platform: fake, targetPlatform: android, scanWatchdog: short);
       final Stream<ShieldError> errors = s.scanErrors;
@@ -125,9 +131,10 @@ void main() {
           reason: 'a native failure ends the scan');
     });
 
-    test(
+    fakeTest(
         'startScan({withServices, mode, removeIfGone}): scanAlreadyStarted '
         'when a scan is active', () async {
+      shield = newShield();
       await shield.startScan(
           withServices: const [svc],
           mode: ScanMode.balanced,
@@ -203,9 +210,10 @@ void main() {
       expect(fake.calls, contains('disconnect:$id'));
     });
 
-    test(
+    fakeTest(
         'disconnect({timeout = 35 s}): cancels the armed reconnection first; '
         'with autoReconnect still on, the drop it causes re-arms', () async {
+      shield = newShield();
       final d = shield.device(id);
       final events = <ReconnectEvent>[];
       d.reconnectEvents.listen(events.add);
@@ -230,9 +238,10 @@ void main() {
       d.setAutoReconnect(false);
     });
 
-    test(
+    fakeTest(
         'setAutoReconnect(enabled, {delay = 3 s}): arms from the initial '
         'disconnected state (kick) and after every drop', () async {
+      shield = newShield();
       final d = shield.device(id);
       d.setAutoReconnect(true, delay: short);
       await wait(250);
@@ -244,9 +253,10 @@ void main() {
       d.setAutoReconnect(false);
     });
 
-    test(
+    fakeTest(
         'reconnectEvents: fired | skipped (disposed, disabled, superseded, '
         'adapter-off) | failed (error text)', () async {
+      shield = newShield();
       final d = shield.device(id);
       final events = <ReconnectEvent>[];
       d.reconnectEvents.listen(events.add);
@@ -337,9 +347,10 @@ void main() {
       expect(fake.writes.single.$4, BleOutputProperty.withResponse);
     });
 
-    test(
+    fakeTest(
         'setNotify(enabled, {timeout = 15 s}): mode chosen from properties; '
         'times out', () async {
+      shield = newShield();
       final c = await characteristicOf();
       await c.setNotify(true);
       expect(fake.notifyCalls.single.$3, BleInputProperty.indication);
@@ -417,7 +428,8 @@ void main() {
           ]));
     });
 
-    test('no error escapes to the zone during a full session', () async {
+    fakeTest('no error escapes to the zone during a full session', () async {
+      shield = newShield();
       final zone = await zoneErrors(() async {
         final d = shield.device(id);
         d.setAutoReconnect(true, delay: short);

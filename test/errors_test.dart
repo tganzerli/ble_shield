@@ -89,6 +89,22 @@ void main() {
           ShieldErrorCode.unknown);
     });
 
+    test('a cancelled picker is cancelled; elsewhere the old mapping holds',
+        () {
+      final cancelled = BleShieldNativeException(
+        code: BleShieldNativeErrorCode.operationCancelled,
+        message: 'User cancelled the requestDevice() chooser.',
+      );
+      expect(mapShieldError(cancelled, op: ShieldOperation.picker).code,
+          ShieldErrorCode.cancelled);
+      expect(mapShieldError(cancelled, op: ShieldOperation.read).code,
+          ShieldErrorCode.gattFailed);
+      expect(mapShieldError(cancelled, op: ShieldOperation.connect).code,
+          ShieldErrorCode.connectFailed);
+      expect(mapShieldError('boom', op: ShieldOperation.picker).code,
+          ShieldErrorCode.unknown);
+    });
+
     test('TimeoutException depends on the operation', () {
       final t = TimeoutException('t', const Duration(seconds: 1));
       expect(mapShieldError(t, op: ShieldOperation.connect).code,

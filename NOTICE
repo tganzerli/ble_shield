@@ -3,7 +3,8 @@ ble_shield
 This product includes software derived from universal_ble 3.2.0
 (https://github.com/Navideck/universal_ble), used under the BSD 3-Clause
 License reproduced below. The derived files are the native layer:
-android/, darwin/, pigeon/, lib/src/native/ and test/native/.
+android/, darwin/, pigeon/, lib/src/native/ and test/native/, and the Web
+layer ported by hand from its web implementation: lib/src/web/.
 See third_party/UPSTREAM.md for how they were imported and changed.
 
 ----------------------------------------------------------------------

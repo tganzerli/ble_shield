@@ -1,12 +1,13 @@
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
-import 'package:ble_shield/src/native/ble_shield_native_pigeon/ble_shield_native_pigeon_channel.dart';
 import 'package:ble_shield/src/native/utils/ble_command_queue.dart';
 import 'package:ble_shield/src/native/utils/cache_handler.dart';
 import 'package:ble_shield/src/native/utils/device_id.dart';
 import 'package:ble_shield/src/native/utils/universal_logger.dart';
 import 'package:ble_shield/src/native/native.dart';
+import 'package:ble_shield/src/web/default_platform.dart'
+    if (dart.library.js_interop) 'package:ble_shield/src/web/default_platform_web.dart';
 
 class BleShieldNative {
   /// Get platform specific implementation.
@@ -1270,9 +1271,8 @@ class BleShieldNative {
   static set onMtuChange(OnMtuChange? onMtuChange) =>
       _platform.onMtuChange = onMtuChange;
 
-  static BleShieldNativePlatform _defaultPlatform() {
-    return BleShieldNativePigeonChannel.instance;
-  }
+  /// The Pigeon channel, or Web Bluetooth on the web (conditional import).
+  static BleShieldNativePlatform _defaultPlatform() => defaultNativePlatform();
 
   static Future<T> _runWithTimeout<T>(
     Future<T> Function() action, {

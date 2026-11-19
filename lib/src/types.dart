@@ -27,7 +27,9 @@ class ScanResult {
     required this.lastSeen,
   });
 
-  /// Lower-case canonical id: MAC on Android, CoreBluetooth UUID on Apple.
+  /// The device id: lower-case MAC on Android, lower-case CoreBluetooth UUID
+  /// on Apple, and the browser's opaque, case-sensitive id (verbatim) on the
+  /// web.
   final String remoteId;
 
   /// Name reported by the platform for this advertisement, empty if none.

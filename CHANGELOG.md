@@ -1,3 +1,19 @@
+## 0.4.0
+
+- Web is now a declared platform, on Web Bluetooth through `dart:js_interop`
+  (no `flutter_web_bluetooth`, no `package:web`; `flutter_web_plugins` from
+  the Flutter SDK). Web has no free scan: `startScan` throws `unsupported`.
+- New `BleShield.requestDevice({withServices, optionalServices,
+  optionalManufacturerData})`: opens the browser's Bluetooth chooser and
+  returns the picked device as a `ScanResult`. Call it from a user gesture.
+  It throws `unsupported` on every other platform.
+- New `ShieldErrorCode.cancelled`, thrown when the user dismisses the
+  chooser. If you `switch` over `ShieldErrorCode` without a default branch,
+  add the case.
+- On the web, remote ids are the browser's opaque, case-sensitive tokens and
+  are kept verbatim; Android and Apple ids are still lower-cased.
+  `ShieldError.platform` is `web` there.
+
 ## 0.3.0
 
 - macOS is now a declared platform (10.15+), on the same shared Darwin

@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'errors.dart';
 import 'mutex.dart';
 import 'native/native.dart';
+import 'native/utils/device_id.dart';
 import 'platform.dart';
 import 'types.dart';
 import 'uuid.dart';
@@ -96,13 +97,29 @@ class BleShield {
 
   bool get _isIOS => !kIsWeb && _target == TargetPlatform.iOS;
 
-  /// `android` | `apple` | null, attached to native errors.
+  /// `android` | `apple` | `web` | null, attached to native errors.
   String? get _platformName => switch (_target) {
-        _ when kIsWeb && _targetPlatformOverride == null => null,
+        _ when kIsWeb && _targetPlatformOverride == null => 'web',
         TargetPlatform.android => 'android',
         TargetPlatform.iOS || TargetPlatform.macOS => 'apple',
         _ => null,
       };
+
+  /// The form ble_shield emits and keys device ids by: lower case for the
+  /// case-insensitive addresses of Android (MAC) and Apple (CoreBluetooth
+  /// UUID), verbatim for the opaque, case-sensitive ids of Web Bluetooth.
+  /// Follows this engine's platform without installing it, so a call that
+  /// only reads ids (e.g. [forgetRestoredId]) takes no native callback slot.
+  /// The native layer keys by its single static platform, so engines with
+  /// different id rules in one isolate are not supported (they already share
+  /// the native callbacks).
+  String _canonicalId(String remoteId) {
+    final id = remoteId.trim();
+    final platform = _platformOverride;
+    return platform == null
+        ? BleShieldNative.canonicalDeviceId(id)
+        : DeviceId.of(id, isAddress: platform.hasAddressDeviceIds).canonical;
+  }
 
   ShieldError _map(Object e, ShieldOperation op, {int? nativeCode}) =>
       mapShieldError(e,
@@ -129,10 +146,10 @@ class BleShield {
     // Diagnostics, routed to devices this engine already handed out. An event
     // for an unknown id is dropped: the value comes back on the next change.
     BleShieldNative.onMtuChange =
-        (id, mtu) => _devices[canonicalRemoteId(id)]?._setMtu(mtu);
+        (id, mtu) => _devices[_canonicalId(id)]?._setMtu(mtu);
     BleShieldNative.onConnectionParametersChange = (update) {
       if (!update.isSuccess) return;
-      _devices[canonicalRemoteId(update.deviceId)]?._setConnectionParameters(
+      _devices[_canonicalId(update.deviceId)]?._setConnectionParameters(
         ShieldConnectionParameters(
           interval: Duration(microseconds: update.interval * 1250),
           latency: update.latency,
@@ -165,7 +182,7 @@ class BleShield {
   }
 
   void _onConnectionChange(BleConnectionChange change) {
-    final id = canonicalRemoteId(change.deviceId);
+    final id = _canonicalId(change.deviceId);
     final device = _devices[id];
     if (change.isConnected) {
       _knownConnected.add(id);
@@ -227,7 +244,7 @@ class BleShield {
     if (_restoredLoaded) return;
     _restoredLoaded = true;
     try {
-      _restored.addAll((await _restoredStore.load()).map(canonicalRemoteId));
+      _restored.addAll((await _restoredStore.load()).map(_canonicalId));
     } catch (_) {
       // Unreadable store: start from what this process saw.
     }
@@ -269,7 +286,7 @@ class BleShield {
   /// Removes [remoteId] from the restored ids and the store.
   Future<void> forgetRestoredId(String remoteId) async {
     await _loadRestored();
-    if (_restored.remove(canonicalRemoteId(remoteId))) {
+    if (_restored.remove(_canonicalId(remoteId))) {
       await _persistRestored();
     }
   }
@@ -307,7 +324,7 @@ class BleShield {
     }
     final result = <ShieldDevice>[];
     for (final d in found) {
-      final id = canonicalRemoteId(d.deviceId);
+      final id = _canonicalId(d.deviceId);
       if (_isAndroid && wanted.isNotEmpty) {
         final known = <String>{
           for (final u in d.services) BleUuidParser.stringOrNull(u) ?? u,
@@ -579,25 +596,72 @@ class BleShield {
     await _stopNativeScan();
   }
 
+  /// Web only: opens the browser's Bluetooth chooser and returns the device
+  /// the user picked. Web Bluetooth has no free scan, so this is how a device
+  /// becomes known there; connect it with `device(result.remoteId)`.
+  ///
+  /// Call it from a user gesture (e.g. a button's `onPressed`) in a secure
+  /// context (HTTPS or localhost): the browser rejects it otherwise. List
+  /// every service you will use in [withServices] (which also filters the
+  /// chooser) or [optionalServices]: the browser blocks GATT access to the
+  /// others. [optionalManufacturerData] lists the company ids whose
+  /// manufacturer data the page may read.
+  ///
+  /// Throws [ShieldErrorCode.cancelled] when the user dismisses the chooser,
+  /// [ShieldErrorCode.unauthorized] without a user gesture,
+  /// [ShieldErrorCode.deviceNotFound] when the browser finds no device, and
+  /// [ShieldErrorCode.unsupported] on every platform other than the web, in
+  /// browsers without Web Bluetooth and outside a secure context (where the
+  /// browser does not expose it). Does not touch the scan session.
+  Future<ScanResult> requestDevice({
+    List<String> withServices = const [],
+    List<String> optionalServices = const [],
+    List<int> optionalManufacturerData = const [],
+  }) async {
+    final services = withServices.map(canonicalUuid).toList();
+    final optional = optionalServices.map(canonicalUuid).toList();
+    _install();
+    final BleDevice d;
+    try {
+      // Only the web options are passed: without `apple`, the Android and
+      // Darwin channel throws notSupported without calling the plugin.
+      d = await BleShieldNative.requestDevice(
+        scanFilter: ScanFilter(withServices: services),
+        platformConfig: PickerPlatformConfig(
+          web: WebOptions(
+            optionalServices: optional,
+            optionalManufacturerData: optionalManufacturerData,
+          ),
+        ),
+      );
+    } catch (e) {
+      throw _map(e, ShieldOperation.picker);
+    }
+    return _scanResultOf(d);
+  }
+
+  ScanResult _scanResultOf(BleDevice d) => ScanResult(
+        remoteId: _canonicalId(d.deviceId),
+        name: (d.rawName ?? d.name ?? '').trim(),
+        rssi: d.rssi ?? -127,
+        connectable: d.connectable ?? true,
+        manufacturerData: {
+          for (final m in d.manufacturerDataList)
+            m.companyId: m.payload.toList(),
+        },
+        serviceUuids: [
+          for (final u in d.services) BleUuidParser.stringOrNull(u) ?? u,
+        ],
+        serviceData: {
+          for (final e in d.serviceData.entries) e.key: e.value.toList(),
+        },
+        lastSeen: DateTime.now(),
+      );
+
   void _onAdvertisement(BleDevice d) {
     if (!_scanning.value) return;
-    final id = canonicalRemoteId(d.deviceId);
-    _seen[id] = ScanResult(
-      remoteId: id,
-      name: (d.rawName ?? d.name ?? '').trim(),
-      rssi: d.rssi ?? -127,
-      connectable: d.connectable ?? true,
-      manufacturerData: {
-        for (final m in d.manufacturerDataList) m.companyId: m.payload.toList(),
-      },
-      serviceUuids: [
-        for (final u in d.services) BleUuidParser.stringOrNull(u) ?? u,
-      ],
-      serviceData: {
-        for (final e in d.serviceData.entries) e.key: e.value.toList(),
-      },
-      lastSeen: DateTime.now(),
-    );
+    final id = _canonicalId(d.deviceId);
+    _seen[id] = _scanResultOf(d);
     if (d.services.isNotEmpty) {
       (_advertisedServices[id] ??= {}).addAll(_seen[id]!.serviceUuids);
     }
@@ -678,7 +742,7 @@ class BleShield {
   /// [ShieldDevice.dispose]. Makes no native call.
   ShieldDevice device(String remoteId) {
     _install();
-    final id = canonicalRemoteId(remoteId);
+    final id = _canonicalId(remoteId);
     return _devices.putIfAbsent(id, () {
       final device = ShieldDevice._(this, id);
       // A connection reported before the device existed (e.g. restoration).

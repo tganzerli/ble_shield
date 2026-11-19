@@ -16,8 +16,3 @@ String canonicalUuid(String input) {
   }
   return parsed;
 }
-
-/// Device ids are case-insensitive addresses (MAC on Android, CoreBluetooth
-/// UUID on Apple). ble_shield emits and keys them in lower case, the same
-/// canonical form the native layer uses.
-String canonicalRemoteId(String remoteId) => remoteId.trim().toLowerCase();

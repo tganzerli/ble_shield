@@ -48,6 +48,10 @@ enum ShieldErrorCode {
   /// The caller passed an invalid argument (e.g. a malformed UUID).
   invalidArgument,
 
+  /// The user dismissed a system picker (the browser's Bluetooth chooser in
+  /// `BleShield.requestDevice`).
+  cancelled,
+
   /// Anything else.
   unknown,
 }
@@ -64,7 +68,7 @@ class ShieldError implements Exception {
   final ShieldErrorCode code;
   final String message;
 
-  /// `android` or `apple` when the error came from the native layer.
+  /// `android`, `apple` or `web` when the error came from the native layer.
   final String? platform;
 
   /// Native status (e.g. Android GATT status 133), when known.
@@ -91,6 +95,9 @@ enum ShieldOperation {
   read,
   write,
   notify,
+
+  /// A system device picker (`BleShield.requestDevice`).
+  picker,
   other,
 }
 
@@ -188,6 +195,10 @@ int? _intOrNull(Object? value) =>
     value is int ? value : (value is String ? int.tryParse(value) : null);
 
 ShieldErrorCode _codeFor(BleShieldNativeErrorCode code, ShieldOperation op) {
+  if (op == ShieldOperation.picker &&
+      code == BleShieldNativeErrorCode.operationCancelled) {
+    return ShieldErrorCode.cancelled;
+  }
   switch (code) {
     case BleShieldNativeErrorCode.bluetoothNotEnabled:
     case BleShieldNativeErrorCode.bluetoothNotAvailable:

@@ -79,7 +79,7 @@ void main() {
       await shield.stopScan();
     });
 
-    test(
+    fakeTest(
         'a native failure reported while startScan runs still ends the session',
         () async {
       fake.startScanDelay = const Duration(milliseconds: 50);
@@ -98,7 +98,7 @@ void main() {
       expect(fake.stopScanCount, 1);
     });
 
-    test('without scanWatchdog (the default) a silent scan keeps running',
+    fakeTest('without scanWatchdog (the default) a silent scan keeps running',
         () async {
       final shield = BleShield(platform: fake, targetPlatform: android);
       expect(shield.scanWatchdog, isNull);
@@ -112,7 +112,7 @@ void main() {
       await shield.stopScan();
     });
 
-    test(
+    fakeTest(
         'watchdog only warns: one scanFailed per silent window, the session '
         'and the native scan keep running', () async {
       final shield = build(watchdog: const Duration(milliseconds: 100));
@@ -144,7 +144,7 @@ void main() {
       expect(scanErrors.length, after, reason: 'stopScan disarms the watchdog');
     });
 
-    test('advertisements keep the watchdog from firing', () async {
+    fakeTest('advertisements keep the watchdog from firing', () async {
       final shield = build(watchdog: const Duration(milliseconds: 100));
       final scanErrors = <ShieldError>[];
       shield.scanErrors.listen(scanErrors.add);
@@ -219,6 +219,8 @@ void main() {
       await shield.stopScan();
     });
 
+    // Real clock: removeIfGone ages results with DateTime.now()
+    // (lib/src/ble_shield.dart), which fake time does not move.
     test('removeIfGone drops devices that stopped advertising', () async {
       final shield = build();
       await shield.startScan(removeIfGone: const Duration(milliseconds: 200));

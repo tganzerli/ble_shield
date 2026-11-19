@@ -1,4 +1,4 @@
-/// A defensive BLE central layer for Flutter (Android, iOS).
+/// A defensive BLE central layer for Flutter (Android, iOS, macOS).
 library;
 
 export 'src/ble_shield.dart'

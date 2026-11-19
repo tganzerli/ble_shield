@@ -35,3 +35,4 @@ Future<List<Object>> zoneErrors(Future<void> Function() body) async {
 
 const android = TargetPlatform.android;
 const iOS = TargetPlatform.iOS;
+const macOS = TargetPlatform.macOS;

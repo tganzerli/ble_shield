@@ -1,7 +1,7 @@
 # ble_shield
 
-A defensive BLE central plugin for Flutter (Android and iOS). It ships its own
-native layer, derived from
+A defensive BLE central plugin for Flutter (Android, iOS and macOS). It ships
+its own native layer, derived from
 [universal_ble](https://pub.dev/packages/universal_ble) 3.2.0 (see
 *Third-party code*), and adds the things a long-running BLE app needs and a
 plain plugin leaves to the caller:
@@ -21,7 +21,7 @@ plain plugin leaves to the caller:
 - opt-in iOS central state restoration for apps with several engines.
 
 ble_shield is published on [pub.dev](https://pub.dev/packages/ble_shield) for
-Android and iOS. It has no dependency on universal_ble, on `bluez`/`dbus` or
+Android, iOS and macOS. It has no dependency on universal_ble, on `bluez`/`dbus` or
 on `flutter_web_bluetooth`, and its native identity (Android package, classes,
 Pigeon channels, iOS module) is its own, so it can share an app with
 universal_ble or flutter_blue_plus.
@@ -73,6 +73,16 @@ Declare what the platform needs:
   ```
 
 - **iOS** (`Info.plist`): `NSBluetoothAlwaysUsageDescription`.
+
+- **macOS**: `NSBluetoothAlwaysUsageDescription` in `Info.plist`, and the
+  `com.apple.security.device.bluetooth` entitlement in both
+  `DebugProfile.entitlements` and `Release.entitlements`. Without the
+  entitlement the App Sandbox blocks Bluetooth.
+
+  ```xml
+  <key>com.apple.security.device.bluetooth</key>
+  <true/>
+  ```
 
 ble_shield does **not** request runtime permissions and has no API for them.
 Request them in the app (for example with `permission_handler`) before
@@ -310,11 +320,42 @@ background one):
 
 ## Platforms
 
-Android (`minSdk` 21) and iOS (13.1). The Darwin sources are shared and build
-for macOS too, but macOS is not declared yet.
+Android (`minSdk` 21), iOS (13.1) and macOS (10.15). iOS and macOS share
+the Darwin sources.
+
+| | Android | iOS | macOS |
+|---|---|---|---|
+| Scan, connect, GATT, notifications | ✓ | ✓ | ✓ |
+| `systemDevices` | ✓ | ✓ | ✓ |
+| `mtu` | ✓ | ✓ | ✓ |
+| `connectionParameters` | 8.0+ | — | — |
+| `turnOn` | ✓ | — | — |
+| State restoration (`configureRestoration`) | — | ✓ (opt-in) | — |
+
+Where a feature is missing, `turnOn` throws `ShieldErrorCode.unsupported`,
+`configureRestoration` returns false and `connectionParameters` stays null.
 
 Permissions are described in *Permissions*. Both CocoaPods and Swift Package
 Manager builds are supported. See `example/` for a complete app.
+
+## Roadmap
+
+ble_shield is growing toward every platform its native layer can reach. A
+platform is declared only once the example app builds and runs on it, and none
+may add a dependency that clashes with common Linux or web packages
+(`bluez`, `dbus`, `flutter_web_bluetooth`).
+
+| Platform | Status |
+|---|---|
+| Android | Available since 0.2.0 |
+| iOS | Available since 0.2.0 |
+| macOS | Available since 0.3.0 |
+| Windows | Planned: C++/WinRT native code, no new Dart dependency |
+| Web | Planned: Web Bluetooth through `dart:js_interop`, with the browser's device chooser in place of a free scan |
+| Linux | Planned: a separate, optional package, so apps that do not target Linux never resolve `bluez` or `dbus` |
+
+When this rollout is complete, ble_shield moves to **1.0.0**. No dates are
+promised.
 
 ## Testing
 

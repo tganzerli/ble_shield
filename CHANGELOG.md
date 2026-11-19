@@ -1,3 +1,13 @@
+## 0.3.0
+
+- macOS is now a declared platform (10.15+), on the same shared Darwin
+  sources as iOS. Apps need `NSBluetoothAlwaysUsageDescription` and the
+  `com.apple.security.device.bluetooth` entitlement. State restoration is
+  iOS-only: `configureRestoration` returns false on macOS. The README has a
+  feature table per platform.
+- The README has a Roadmap: Windows, Web and Linux are planned, and the
+  package reaches 1.0.0 when that rollout is complete.
+
 ## 0.2.3
 
 - Documentation only: the README covers installation, runtime permissions

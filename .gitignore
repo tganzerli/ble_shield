@@ -10,5 +10,8 @@ coverage/
 example/ios/Pods/
 example/ios/.symlinks/
 example/ios/Flutter/ephemeral/
+example/macos/Pods/
+example/macos/Flutter/ephemeral/
+.build/
 example/android/.gradle/
 example/android/local.properties

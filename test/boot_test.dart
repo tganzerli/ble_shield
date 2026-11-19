@@ -89,16 +89,19 @@ void main() {
       expect(await shield.configureRestoration('app.central'), isFalse);
     });
 
-    test('off iOS: false, without calling the configurator', () async {
-      var called = false;
-      final shield = BleShield(
-          platform: fake,
-          targetPlatform: android,
-          restorationConfigurator: (_) async => called = true);
-      expect(await shield.configureRestoration('app.central'), isFalse);
-      expect(called, isFalse);
-      expect(fake.calls, isEmpty);
-    });
+    for (final target in [android, macOS]) {
+      test('off iOS ($target): false, without calling the configurator',
+          () async {
+        var called = false;
+        final shield = BleShield(
+            platform: fake,
+            targetPlatform: target,
+            restorationConfigurator: (_) async => called = true);
+        expect(await shield.configureRestoration('app.central'), isFalse);
+        expect(called, isFalse);
+        expect(fake.calls, isEmpty);
+      });
+    }
 
     test('an invalid identifier is a typed error', () async {
       final shield = BleShield(
